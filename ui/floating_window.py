@@ -13,6 +13,7 @@ import tkinter as tk
 from typing import Callable, Optional
 
 import monitors
+from cache import ImageLoader
 from config import Config
 from models import MerchantSnapshot
 from ui.theme import (ACCENT, BG, BORDER, BORDER_HOVER, MUTED, MONEY, RARITY_COLORS,
@@ -21,6 +22,7 @@ from ui.theme import (ACCENT, BG, BORDER, BORDER_HOVER, MUTED, MONEY, RARITY_COL
 
 MAX_ROWS = 5
 HEADER_H = 34
+ICON_PX = 18          # 行内物品图标尺寸
 
 
 class FloatingWindow(tk.Toplevel):
@@ -28,9 +30,14 @@ class FloatingWindow(tk.Toplevel):
 
     def __init__(self, master: tk.Misc, config: Config,
                  on_close: Optional[Callable[[], None]] = None,
-                 on_activate: Optional[Callable[[], None]] = None) -> None:
+                 on_activate: Optional[Callable[[], None]] = None,
+                 loader: Optional[ImageLoader] = None) -> None:
         super().__init__(master, bg=BORDER)
         self.config_data = config
+        # 与主窗口共用同一个加载器：磁盘缓存与内存缓存都能复用，不会重复请求
+        self.loader = loader
+        self._show_icons = bool(getattr(config, "floating_show_icons", True))
+        self._icon_widgets: list[tk.Widget] = []
         self._on_close = on_close
         self._on_activate = on_activate
         self._topmost = bool(config.floating_topmost)
@@ -245,6 +252,7 @@ class FloatingWindow(tk.Toplevel):
             except tk.TclError:
                 pass
         self._rows.clear()
+        self._icon_widgets.clear()
 
     def set_snapshot(self, snapshot: MerchantSnapshot) -> None:
         previous = self._snapshot
@@ -298,6 +306,20 @@ class FloatingWindow(tk.Toplevel):
         row = tk.Frame(self.rows_frame, bg=SURFACE)
         row.pack(fill="x", pady=2)
 
+        # 物品图标（可关闭）。关掉时只是不创建这个控件，
+        # 珍惜度圆点、名称、价格、倒计时等一概不受影响。
+        if self._show_icons and self.loader is not None and item.icon_url:
+            icon = tk.Canvas(row, width=ICON_PX, height=ICON_PX, bg=SURFACE,
+                             highlightthickness=0, bd=0)
+            icon.create_rectangle(0, 0, ICON_PX, ICON_PX, fill=SURFACE_2, outline="")
+            icon.pack(side="left", padx=(0, 5), pady=(1, 0))
+            self._icon_widgets.append(icon)
+            self.loader.load(
+                item.icon_url,
+                lambda photo, canvas=icon: self._apply_row_icon(canvas, photo),
+                size=ICON_PX,
+            )
+
         dot = tk.Canvas(row, width=8, height=8, bg=SURFACE, highlightthickness=0, bd=0)
         color = RARITY_COLORS.get(item.rarity.level, MUTED)
         dot.create_oval(1, 1, 7, 7, fill=color, outline="")
@@ -311,6 +333,46 @@ class FloatingWindow(tk.Toplevel):
         name.pack(side="left", padx=(6, 6), fill="x", expand=True)
 
         return row
+
+    def _apply_row_icon(self, canvas: tk.Canvas, photo) -> None:
+        if photo is None:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+            canvas.delete("all")
+            canvas.create_image(ICON_PX / 2, ICON_PX / 2, image=photo)
+            canvas.image = photo        # 保住引用，避免被回收
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------ 图标开关
+    def set_show_icons(self, enabled: bool) -> None:
+        """开关行内物品图标；只重排列表，窗口位置与状态都不受影响。"""
+        enabled = bool(enabled)
+        if enabled == self._show_icons:
+            return
+        self._show_icons = enabled
+        self.config_data.floating_show_icons = enabled
+        if self._snapshot is not None:
+            try:
+                self._render(self._snapshot)
+                self._apply_size()
+            except tk.TclError:
+                pass
+
+    @property
+    def show_icons(self) -> bool:
+        return self._show_icons
+
+    def attach_loader(self, loader: Optional[ImageLoader]) -> None:
+        """主窗口换了图片加载器（例如改了图标缓存目录）时同步过来并重绘。"""
+        self.loader = loader
+        if self._snapshot is not None and self._show_icons:
+            try:
+                self._render(self._snapshot)
+            except tk.TclError:
+                pass
 
     @staticmethod
     def _footer_text(snapshot: MerchantSnapshot) -> str:

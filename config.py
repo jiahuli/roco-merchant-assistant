@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -174,6 +174,7 @@ class Config:
     floating_enabled: bool = False
     floating_topmost: bool = True
     floating_geometry: str = ""
+    floating_show_icons: bool = True    # 悬浮窗里是否显示物品图标
 
     # 渠道表
     providers: dict[str, dict[str, Any]] = field(
@@ -222,7 +223,8 @@ class Config:
         # 布尔字段容错（手工改配置时可能写成 "true" / 1）
         for key in ("auto_fallback", "notify_enabled", "notify_native", "notify_toast",
                     "notify_sound", "notify_flash", "icon_cache_enabled", "autostart", "close_to_tray", "tray_enabled",
-                    "floating_enabled", "floating_topmost", "show_closed_message"):
+                    "floating_enabled", "floating_topmost", "floating_show_icons",
+                    "show_closed_message"):
             setattr(cfg, key, bool(getattr(cfg, key)))
 
         # 清洗查询时间

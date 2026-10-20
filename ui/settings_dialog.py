@@ -279,7 +279,10 @@ class SettingsDialog(tk.Toplevel):
         options.pack(fill="x")
         self._float_var = tk.BooleanVar(value=self._draft.floating_enabled)
         self._float_top_var = tk.BooleanVar(value=self._draft.floating_topmost)
-        for text, var in (("启用悬浮窗", self._float_var), ("总在最前", self._float_top_var)):
+        self._float_icons_var = tk.BooleanVar(value=self._draft.floating_show_icons)
+        for text, var in (("启用悬浮窗", self._float_var),
+                          ("总在最前", self._float_top_var),
+                          ("显示物品图标", self._float_icons_var)):
             tk.Checkbutton(
                 options, text=text, variable=var,
                 bg=SURFACE, fg=TEXT_DIM, activebackground=SURFACE, activeforeground=TEXT,
@@ -288,8 +291,10 @@ class SettingsDialog(tk.Toplevel):
 
         tk.Label(
             holder,
-            text="拖动窗顶可移动位置；「–」收起成横条；位置会记住。",
-            bg=SURFACE, fg=MUTED, font=ui_font(8), anchor="w",
+            text="拖动窗顶可移动位置；「–」收起成横条；位置会记住。"
+                 "关闭「显示物品图标」后行内只保留珍惜度圆点与名称价格，更紧凑。",
+            bg=SURFACE, fg=MUTED, font=ui_font(8), anchor="w", justify="left",
+            wraplength=580,
         ).pack(fill="x", pady=(6, 0))
 
     # -------------------------------------------------------------- 缓存
@@ -486,6 +491,7 @@ class SettingsDialog(tk.Toplevel):
         draft.webhook_url = self._webhook_var.get().strip()
         draft.floating_enabled = bool(self._float_var.get())
         draft.floating_topmost = bool(self._float_top_var.get())
+        draft.floating_show_icons = bool(self._float_icons_var.get())
         draft.autostart = bool(self._autostart_var.get()) if autostart.is_supported() else False
         draft.close_to_tray = bool(self._close_tray_var.get())
         draft.log_dir = self._log_dir_var.get().strip()

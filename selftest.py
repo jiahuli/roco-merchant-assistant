@@ -605,6 +605,81 @@ def test_main_window_geometry():
     app.quit_app()
 
 
+def test_floating_icon_switch():
+    """悬浮窗物品图标开关：开=有图标，关=无图标且其余内容不受影响。"""
+
+    class _StubLoader:
+        """只回一个空图片，避免测试打网络。"""
+
+        def load(self, url, callback, size=None):
+            callback(None)
+
+        def shutdown(self):
+            pass
+
+    from ui.floating_window import FloatingWindow
+
+    root = tk.Tk()
+    root.withdraw()
+    config = Config()
+    config.floating_show_icons = True
+    config.floating_geometry = ""
+
+    snapshot = MerchantSnapshot(
+        items=[
+            MerchantItem("黑晶琉璃", 1000, 100, icon_url="https://example.invalid/a.png",
+                         rarity=infer_rarity("黑晶琉璃", 1000)),
+            MerchantItem("棱镜球", 3200000, 2, icon_url="https://example.invalid/b.png",
+                         rarity=infer_rarity("棱镜球", 3200000)),
+        ],
+        status="open", round_index=3, next_refresh="2026-10-20 20:00",
+    )
+
+    window = FloatingWindow(root, config, loader=_StubLoader())
+    window.set_snapshot(snapshot)
+    window.update_countdown("01:02:03")
+    window.update()
+
+    check("默认显示物品图标", window.show_icons is True)
+    check("图标控件已创建", len(window._icon_widgets) == 2, str(len(window._icon_widgets)))
+
+    def labels_in_rows():
+        texts = []
+        for row in window._rows:
+            for child in row.winfo_children():
+                if isinstance(child, tk.Label):
+                    texts.append(child.cget("text"))
+        return texts
+
+    before_labels = labels_in_rows()
+    before_pos = (window.winfo_x(), window.winfo_y())
+    before_rows = len(window._rows)
+
+    window.set_show_icons(False)
+    window.update()
+
+    check("关闭后没有图标控件", len(window._icon_widgets) == 0, str(len(window._icon_widgets)))
+    check("关闭后行数不变", len(window._rows) == before_rows, f"{before_rows}->{len(window._rows)}")
+    check("关闭后名称与价格仍在", labels_in_rows() == before_labels, str(labels_in_rows()))
+    check("关闭后仍显示倒计时", "01:02:03" in window.countdown_label.cget("text"))
+    check("关闭后位置不变", (window.winfo_x(), window.winfo_y()) == before_pos,
+          f"{before_pos}->{(window.winfo_x(), window.winfo_y())}")
+    check("关闭后写入配置", config.floating_show_icons is False)
+
+    window.set_show_icons(True)
+    window.update()
+    check("重新打开图标恢复", len(window._icon_widgets) == 2, str(len(window._icon_widgets)))
+    check("恢复后名称价格一致", labels_in_rows() == before_labels)
+
+    # 收起态也不受影响
+    window.toggle_collapse()
+    window.update()
+    check("收起后仍正常", window.winfo_height() < 60, str(window.winfo_height()))
+
+    window.destroy()
+    root.destroy()
+
+
 def test_tray_icon():
     """托盘图标：创建、菜单可生成、气泡可用、可清理。"""
     import tray as tray_module
@@ -678,7 +753,7 @@ def _run_all():
                test_notify_fallback_chain, test_monitor_math,
                test_floating_multimonitor, test_logging, test_tk_error_hook,
                test_main_window_geometry,
-               test_tray_icon, test_close_to_tray_switch):
+               test_floating_icon_switch, test_tray_icon, test_close_to_tray_switch):
         try:
             fn()
         except Exception as exc:

@@ -292,6 +292,7 @@ class MerchantApp:
                     self.root, self.config,
                     on_close=self._on_floating_closed,
                     on_activate=self.show_from_background,
+                    loader=self.loader,          # 共用主窗口的图标缓存
                 )
             self.floating.deiconify()
             self.floating.attributes("-topmost", self.config.floating_topmost)
@@ -762,6 +763,10 @@ class MerchantApp:
 
         # 悬浮窗
         self.toggle_floating(new_config.floating_enabled, quiet=True)
+        if self.floating is not None:
+            # 缓存目录可能刚被换掉：先接上新加载器，再同步图标开关
+            self.floating.attach_loader(self.loader)
+            self.floating.set_show_icons(new_config.floating_show_icons)
         self.float_btn.set_text(self._float_text())
 
         self._update_status_right()
