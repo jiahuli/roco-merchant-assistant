@@ -3,9 +3,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 构建中间产物（dist 里的 exe 需要随仓库分发，故不忽略 dist/）
+# 构建产物一律不入库：
+# exe 只作为 Release 资产分发，仓库里不存二进制，避免每版多一份 14MB blob
 .buildenv/
 build/
+dist/
 
 # 本地配置与日志
 *.log

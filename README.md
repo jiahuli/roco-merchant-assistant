@@ -89,13 +89,16 @@
 
 ## 运行
 
-### 方式一：直接跑 exe
+### 方式一：直接跑 exe（推荐）
 
-从 [Releases](../../releases) 或仓库内 `dist/远行商人助手.exe` 下载，双击运行。
+**[⬇ 下载最新版 RocoMerchantAssistant.exe](https://github.com/jiahuli/roco-merchant-assistant/releases/latest/download/RocoMerchantAssistant.exe)**
+
+这条链接是**固定直链**，永远指向当前最新版本，不需要随版本更新。
 
 - 单文件、绿色免安装，可拷到任意 Windows 10/11 机器
 - 首次启动约 1 秒（单文件解包）
 - **未做代码签名**，首次运行时 SmartScreen 可能提示"未知发布者"，选择"仍要运行"即可
+- 想装旧版本：到 [Releases](https://github.com/jiahuli/roco-merchant-assistant/releases) 按 tag 取，每个版本各自保留自己的 exe
 
 ### 方式二：源码运行
 
@@ -118,6 +121,38 @@ build_exe.bat
 ```
 
 脚本会自动创建 `.buildenv` 虚拟环境、安装 PyInstaller、生成图标、按 `app.spec` 打包，产物在 `dist\远行商人助手.exe`。
+
+---
+
+## 发布与归档
+
+仓库**不保存 exe**（`dist/` 已列入 `.gitignore`）。二进制只作为 Release 资产分发，避免每发一版就在 git 历史里多攒一个 14 MB 的 blob。
+
+### 「最新版本」怎么判定
+- 版本号唯一来源是 `config.py` 的 `APP_VERSION`，tag 固定为 `v{APP_VERSION}`
+- GitHub 的 `/releases/latest` 按 **tag 的语义化版本排序**（排除 draft 与 prerelease），**不是**按发布时间
+- 因此：tag 必须 `vMAJOR.MINOR.PATCH` 严格递增；正式版不要用 `--prerelease` 发布，否则 latest 会指回旧版
+
+### 命名规则
+| 场景 | 资产名 | 说明 |
+| --- | --- | --- |
+| 最新 Release | `RocoMerchantAssistant.exe` | 固定名，`/releases/latest/download/` 依赖它 |
+| 被新版本取代后 | `RocoMerchantAssistant-v{tag}.exe` | 自动改名归档，下载后能看出是哪一版 |
+
+改名由 `tools/release.py` 的 `archive_previous()` 完成：新建 Release 后，它会把**其它所有 Release** 里叫 `RocoMerchantAssistant.exe` 的资产重命名为带版本号的形式；当前版本始终占用固定名。
+
+### 展示效果
+- **Releases 页**：只有最新版的资产名是 `RocoMerchantAssistant.exe`，其余历史版本挂在各自 tag 下、名字带版本号
+- **README**：只写一条固定直链，不随版本改动
+- **仓库文件树**：没有 exe，只有源码与脚本
+
+### 改动位置与参数
+- `tools/release.py` —— 发布脚本。`STABLE_ASSET` 常量控制固定名，`archive_previous()` 控制归档；`--asset` 指定 exe 路径，`--draft` 先发草稿，`--archive-only` 只归档不发布
+- `.github/workflows/release.yml` —— CI。触发条件 `on.push.tags: v*`；`permissions.contents: write` 是上传资产的前提；`env.GH_TOKEN` 取 `secrets.GITHUB_TOKEN`；`actions/checkout` 需 `fetch-depth: 0`（脚本要查 tag）
+- `config.py` —— `APP_VERSION`，改这里即可发新版
+- `.gitignore` —— `dist/` 行，决定了 exe 不入库
+
+> 已发布过的旧 blob 仍留在 git 历史里，工作区删掉不会缩小 `.git`。要彻底清理需重写历史（`git filter-repo --path dist/ --invert-paths` 后强推），本项目未执行——因为会改写所有 commit hash。
 
 ---
 
@@ -184,8 +219,10 @@ roco-merchant/
 ├── applog.py               # 日志与异常钩子
 ├── selftest.py             # 自测（95 项）
 ├── tools/make_icon.py      # 纯标准库生成 assets/app.ico
+├── tools/release.py        # 发布：上传 exe 到 Release + 归档旧版
+├── .github/workflows/release.yml  # CI：推 tag 自动打包发布
 ├── assets/app.ico          # 应用图标（构建 exe 用）
-├── dist/                   # 打包产物
+├── dist/                   # 本地打包产物（.gitignore，不入库）
 └── ui/
     ├── theme.py            # 配色、字体、圆角绘制
     ├── widgets.py          # 圆角按钮、珍惜度徽章、商品卡片、滚动容器
