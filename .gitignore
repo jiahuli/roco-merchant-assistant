@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建中间产物（dist 里的 exe 需要随仓库分发，故不忽略 dist/）
+.buildenv/
+build/
+
+# 本地配置与日志
+*.log
+config.json
+state.json
+
+# 临时自检脚本
+_probe*.py
+_harness*.py
+_shot*.png
