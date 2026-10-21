@@ -57,9 +57,13 @@ def release_of(tag: str) -> dict | None:
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except json.JSONDecodeError:
         return None
+    # 404 时 gh 会把 {"message": "Not Found"} 打到 stdout，不能当成"已存在"
+    if not isinstance(data, dict) or "id" not in data:
+        return None
+    return data
 
 
 def all_releases() -> list[dict]:
