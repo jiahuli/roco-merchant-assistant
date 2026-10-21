@@ -60,6 +60,7 @@ class MerchantSnapshot:
     fetched_at: datetime = field(default_factory=datetime.now)
     stale: bool = False
     message: str = ""
+    route: dict = field(default_factory=dict)   # 直连路由信息（IP / 是否大陆 / 延迟）
 
     @property
     def is_open(self) -> bool:

@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -29,21 +29,37 @@ APP_VERSION = "1.3.0"
 DEFAULT_PROVIDERS: dict[str, dict[str, Any]] = {
     "official": {
         "label": "官方公开 API",
+        "region": "",
         "base_url": "",  # 官方目前未开放该接口，留空即自动跳过
         "api_key": "",
         "note": "腾讯/魔方官方目前没有公开远行商人 API。若日后上线，把地址填在此处，"
                 "程序会优先走官方接口；留空则自动跳过。",
         "official": True,
     },
+    "cn_mirror": {
+        "label": "大陆反代 · 自建",
+        "region": "cn",
+        "base_url": "",
+        "api_key": "",
+        "preferred_ip": "",
+        "note": "把你自建的中国大陆反向代理地址填在这里（转发到社区镜像即可），"
+                "填好后优先使用：目标 IP 在大陆，路由器分流规则会放行直连，"
+                "不会绕到 VPN 节点。docs/cn-mirror.md 有一份可直接用的配置。",
+        "official": False,
+    },
     "rkw": {
         "label": "社区镜像 · 洛克 Wiki",
+        "region": "overseas",
         "base_url": "https://rocokingdomworld.org/api/merchant",
         "api_key": "",
-        "note": "免费、免 Key，字段最全（价格 / 限购 / 图标 / 轮次 / 下次刷新），默认渠道。",
+        "note": "免费、免 Key，字段最全（价格 / 限购 / 图标 / 轮次 / 下次刷新），默认渠道。"
+                "注意它托管在 Cloudflare（境外 IP），会被路由器端代理转发。",
+        "preferred_ip": "",
         "official": False,
     },
     "yxsr": {
         "label": "社区精简 · 资源卡",
+        "region": "overseas",
         "base_url": "https://yxsr.vercel.app/api/merchant",
         "api_key": "",
         "note": "免费免 Key，但只返回商品名，不含价格与图标，作为极简兜底。",
@@ -51,13 +67,17 @@ DEFAULT_PROVIDERS: dict[str, dict[str, Any]] = {
     },
     "shallow": {
         "label": "洛克魔法书（需自备 Key）",
+        "region": "cn",
         "base_url": "https://wegame.shallow.ink/api/v1/games/rocom/merchant/info",
         "api_key": "",
-        "note": "第三方付费服务，需在请求头带 Bearer Key；未填 Key 时自动跳过。",
+        "note": "第三方付费服务，需在请求头带 Bearer Key；未填 Key 时自动跳过。"
+                "★ 服务器在中国大陆（实测 124.226.74.x，延迟约 140ms），"
+                "是现有渠道里唯一天然满足\"接口在境内\"的选项。",
         "official": False,
     },
     "custom": {
         "label": "自定义接口",
+        "region": "",
         "base_url": "",
         "api_key": "",
         "note": "任何返回 JSON 的接口都可以接。程序会自动识别 items / goods_list / data.list "
@@ -144,6 +164,12 @@ class Config:
     auto_fallback: bool = True          # 当前渠道失败时自动尝试下一个可用渠道
     request_timeout: int = 15
 
+    # 网络直连（绕过 shellclash 等路由器端 / 本机代理）
+    force_direct: bool = True           # 剥离代理环境变量 + 禁用系统代理
+    doh_enabled: bool = True            # 用 DoH 取真实 IP，绕开 fake-ip 劫持
+    prefer_cn_region: bool = True       # 优先选择中国大陆渠道
+    verify_egress: bool = True          # 每次查询后校验真实出口（多一次轻量请求）
+
     # 定时查询（24 小时制 HH:MM）
     query_times: list[str] = field(default_factory=lambda: list(QUERY_TIME_PRESETS["默认（刷新后 5 分钟）"]))
 
@@ -213,7 +239,7 @@ class Config:
                 continue
             if pid in merged:
                 # 只接受用户可改的字段；label/note/official 以代码为准，升级后不会显示旧文案
-                for key in ("base_url", "api_key", "headers"):
+                for key in ("base_url", "api_key", "headers", "preferred_ip"):
                     if key in pdata:
                         merged[pid][key] = pdata[key]
             else:
@@ -223,6 +249,7 @@ class Config:
         # 布尔字段容错（手工改配置时可能写成 "true" / 1）
         for key in ("auto_fallback", "notify_enabled", "notify_native", "notify_toast",
                     "notify_sound", "notify_flash", "icon_cache_enabled", "autostart", "close_to_tray", "tray_enabled",
+                    "force_direct", "doh_enabled", "prefer_cn_region", "verify_egress",
                     "floating_enabled", "floating_topmost", "floating_show_icons",
                     "show_closed_message"):
             setattr(cfg, key, bool(getattr(cfg, key)))
@@ -243,8 +270,12 @@ class Config:
         return self.providers.get(pid, {}).get("label", pid)
 
     def provider_order(self) -> list[str]:
-        """自动降级顺序：官方 → 社区免费 → 需 Key → 自定义。"""
-        order = ["official", "rkw", "yxsr", "shallow", "custom"]
+        """自动降级顺序：官方 → 大陆反代 → 社区免费 → 需 Key → 自定义。
+
+        大陆反代排在社区镜像之前：它一旦配置好，目标 IP 就在大陆，
+        路由器端分流会放行直连，不必绕 VPN 节点。
+        """
+        order = ["official", "cn_mirror", "rkw", "yxsr", "shallow", "custom"]
         return [p for p in order if p in self.providers]
 
 

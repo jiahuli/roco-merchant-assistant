@@ -15,14 +15,15 @@ hidden = [
     "ui.settings_dialog", "ui.floating_window",
     "providers", "rarity", "numerals", "cache", "scheduler",
     "notifier", "notifier_native", "autostart", "single_instance", "models", "config",
-    "monitors", "tray",
+    "monitors", "tray", "netdirect",
 ]
 
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("assets/app.ico", "assets")],
+    datas=[("assets/app.ico", "assets"),
+           ("data/cn_ipv4.txt", "data")],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},

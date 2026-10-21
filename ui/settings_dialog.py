@@ -83,6 +83,7 @@ class SettingsDialog(tk.Toplevel):
 
         self._build_schedule(body)
         self._build_provider(body)
+        self._build_network(body)
         self._build_notify(body)
         self._build_floating(body)
         self._build_cache(body)
@@ -198,6 +199,71 @@ class SettingsDialog(tk.Toplevel):
         conf = self._draft.providers.setdefault(pid, {})
         conf["base_url"] = self._url_var.get().strip()
         conf["api_key"] = self._key_var.get().strip()
+
+    # -------------------------------------------------------------- 网络直连
+    def _build_network(self, master: tk.Misc) -> None:
+        holder = _section(master, "网络直连", "绕开 shellclash 等代理软件的劫持")
+
+        options = tk.Frame(holder, bg=SURFACE)
+        options.pack(fill="x")
+        self._direct_var = tk.BooleanVar(value=self._draft.force_direct)
+        self._doh_var = tk.BooleanVar(value=self._draft.doh_enabled)
+        self._cn_var = tk.BooleanVar(value=self._draft.prefer_cn_region)
+        self._egress_var = tk.BooleanVar(value=self._draft.verify_egress)
+        for text, var in (
+            ("强制直连（剥离代理）", self._direct_var),
+            ("DoH 取真实 IP", self._doh_var),
+            ("优先大陆渠道", self._cn_var),
+            ("校验出口", self._egress_var),
+        ):
+            tk.Checkbutton(
+                options, text=text, variable=var,
+                bg=SURFACE, fg=TEXT_DIM, activebackground=SURFACE, activeforeground=TEXT,
+                selectcolor=SURFACE_2, font=ui_font(9), bd=0, highlightthickness=0,
+            ).pack(side="left", padx=(0, 14))
+
+        tk.Label(
+            holder,
+            text="强制直连：清空 http_proxy 等环境变量并禁用 system 代理，"
+                 "全进程不再走任何 HTTP 代理；DoH：绕开 Clash 的 fake-ip 劫持，取得真实 IP 后按 IP 直连，"
+                 "TLS 证书仍按域名校验。",
+            bg=SURFACE, fg=MUTED, font=ui_font(8), anchor="w", justify="left",
+            wraplength=580,
+        ).pack(fill="x", pady=(8, 0))
+
+        tk.Label(
+            holder,
+            text="注意：路由器端的透明代理（TProxy / REDIRECT）在报文层改写 TCP，"
+                 "客户端无法单方面绕过。目标在中国大陆时 Clash 会按 GEOIP 放行直连；"
+                 "目标在境外则必然被转发到节点——此时请用「大陆反代」渠道或加下面的直连规则。",
+            bg=SURFACE, fg=theme.WARNING, font=ui_font(8), anchor="w", justify="left",
+            wraplength=580,
+        ).pack(fill="x", pady=(6, 0))
+
+        actions = tk.Frame(holder, bg=SURFACE)
+        actions.pack(fill="x", pady=(10, 0))
+        PillButton(actions, "网络诊断", self._open_network_dialog, width=96, height=28,
+                   font_size=9).pack(side="left")
+        PillButton(actions, "复制直连规则", self._copy_direct_rules, style="subtle",
+                   width=112, height=28, font_size=9).pack(side="left", padx=(8, 0))
+        self._net_hint = tk.Label(
+            actions, text="", bg=SURFACE, fg=theme.SUCCESS, font=ui_font(8), anchor="e",
+        )
+        self._net_hint.pack(side="right")
+
+    def _open_network_dialog(self) -> None:
+        from ui.network_dialog import NetworkDialog
+
+        NetworkDialog(self, self._draft)
+
+    def _copy_direct_rules(self) -> None:
+        import netdirect
+
+        rules = netdirect.clash_rules(netdirect.default_hosts(self._draft.providers))
+        self.clipboard_clear()
+        self.clipboard_append(rules)
+        self._net_hint.configure(text="已复制到剪贴板")
+        self.after(2600, lambda: self._net_hint.configure(text=""))
 
     # -------------------------------------------------------------- 通知
     def _build_notify(self, master: tk.Misc) -> None:
@@ -482,6 +548,10 @@ class SettingsDialog(tk.Toplevel):
         draft.query_times = times
         draft.provider = self._current_pid
         draft.auto_fallback = bool(self._fallback_var.get())
+        draft.force_direct = bool(self._direct_var.get())
+        draft.doh_enabled = bool(self._doh_var.get())
+        draft.prefer_cn_region = bool(self._cn_var.get())
+        draft.verify_egress = bool(self._egress_var.get())
         draft.notify_enabled = bool(self._notify_var.get())
         draft.notify_native = bool(self._native_var.get())
         draft.notify_toast = bool(self._toast_var.get())

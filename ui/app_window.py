@@ -12,6 +12,7 @@ from cache import ICON_SIZE, IconCache, ImageLoader, has_pillow, migrate_cache
 import applog
 import autostart
 import monitors
+import netdirect
 import tray as tray_module
 from config import Config, resolve_icon_cache_dir, resource_path, state_path
 from models import MerchantSnapshot
@@ -63,6 +64,11 @@ class MerchantApp:
         applog.info("主窗口就绪 | 显示器 %s 块 | 渠道 %s | 定时 %s",
                     len(monitors.enum_monitors()), config.provider,
                     ",".join(config.query_times))
+        applog.info("直连状态 | 代理剥离=%s | DoH=%s | 大陆 IP 段=%s 条 | 环境代理变量=%s",
+                    "开" if config.force_direct else "关",
+                    "开" if config.doh_enabled else "关",
+                    netdirect.cn_range_count(),
+                    ", ".join(netdirect.proxy_env_snapshot()) or "无")
         self.scheduler.start()
         self._pump_results()
         self.root.after(220, lambda: self.refresh(reason="启动"))
@@ -72,6 +78,9 @@ class MerchantApp:
     # -------------------------------------------------------------- 结果泵
     def _pump_results(self) -> None:
         """在主线程消化后台请求结果（Tk 不允许跨线程操作控件）。"""
+        if getattr(self, "_closing", False):
+            return
+
         while True:
             try:
                 future, reason = self._results.get_nowait()
@@ -235,6 +244,10 @@ class MerchantApp:
         self.channel_btn.pack(side="left")
 
         PillButton(bar, "设置", self.open_settings, width=72).pack(side="left", padx=(10, 0))
+        self.net_btn = PillButton(
+            bar, self._net_text(), self.open_network_dialog, width=92, height=34
+        )
+        self.net_btn.pack(side="left", padx=(6, 0))
 
         self.float_btn = PillButton(
             bar, self._float_text(), lambda: self.toggle_floating(), width=104, height=34
@@ -266,8 +279,52 @@ class MerchantApp:
             inner, text="", bg=SURFACE, fg=MUTED, font=ui_font(8), anchor="e",
         )
         self.status_right.pack(side="right")
+        self.net_label = tk.Label(
+            inner, text="", bg=SURFACE, fg=MUTED, font=ui_font(8), anchor="e",
+        )
+        self.net_label.pack(side="right", padx=(0, 14))
 
     # ------------------------------------------------------------------ 文案
+    def _net_text(self) -> str:
+        """按钮上直接显示当前出口归属，省得每次都要开面板。"""
+        route = (self.snapshot.route if self.snapshot else {}) or {}
+        if not route:
+            return "网络：待测"
+        if route.get("is_cn"):
+            return "网络：大陆直连"
+        return "网络：境外出口"
+
+    def open_network_dialog(self) -> None:
+        from ui.network_dialog import NetworkDialog
+
+        NetworkDialog(self.root, self.config)
+
+    def _update_net_status(self) -> None:
+        """把直连状态写进状态栏：目标是否大陆、出口落在哪。"""
+        route = (self.snapshot.route if self.snapshot else {}) or {}
+        if not route:
+            self.net_label.configure(text="")
+            self.net_btn.set_text(self._net_text())
+            return
+
+        egress = route.get("egress") or {}
+        country = str(egress.get("country") or "")
+        host_ip = route.get("ip") or "?"
+        if country and country != "CN":
+            text = f"出口 {country}/{egress.get('colo', '?')} · 已被代理转发"
+            color = WARNING
+        elif route.get("is_cn"):
+            text = f"直连 {host_ip} · 中国大陆"
+            color = SUCCESS
+        elif country == "CN":
+            text = f"直连 · 出口 {egress.get('ip', '')}"
+            color = SUCCESS
+        else:
+            text = f"直连 {host_ip} · 境外"
+            color = MUTED
+        self.net_label.configure(text=text, fg=color)
+        self.net_btn.set_text(self._net_text())
+
     def _channel_text(self) -> str:
         label = self.config.provider_label(self.config.provider)
         if len(label) > 14:
@@ -364,9 +421,18 @@ class MerchantApp:
 
         self.snapshot = snapshot
         self._error_text = ""
-        applog.info("查询成功 | %s | 第%s轮 | %s 件 | 更新于 %s",
-                    snapshot.source_label, snapshot.round_index,
-                    len(snapshot.items), snapshot.fetched_at.strftime("%H:%M:%S"))
+        route = snapshot.route or {}
+        egress = route.get("egress") or {}
+        applog.info("查询成功 | %s | 第%s轮 | %s 件 | 更新于 %s | 目标 %s(%s) 出口 %s %s",
+                    snapshot.source_label, snapshot.round_index, len(snapshot.items),
+                    snapshot.fetched_at.strftime("%H:%M:%S"),
+                    route.get("ip", "?"),
+                    "大陆" if route.get("is_cn") else "境外",
+                    egress.get("ip", "?"), egress.get("country", "?"))
+        if egress.get("country") and egress.get("country") != "CN":
+            applog.warning("出口不在中国大陆（%s/%s），流量已由代理接管；"
+                           "建议改用大陆反代渠道或在路由器侧加 DIRECT 规则",
+                           egress.get("country"), egress.get("colo", "?"))
         self._render(snapshot)
         if errors:
             self.status_left.configure(
@@ -477,6 +543,8 @@ class MerchantApp:
                     accent=WARNING,
                 )
             self._update_status_right()
+            self._update_net_status()      # 打烊时也要显示出口，否则状态栏是空的
+            self._sync_tray_tooltip()
             return
 
         grid = self._ensure_grid()
@@ -497,6 +565,7 @@ class MerchantApp:
         self._layout_cards(force=True)
         self._update_status_right()
         self._update_cache_label()
+        self._update_net_status()
         self._sync_tray_tooltip()
 
     def _render_error(self, message: str) -> None:
@@ -732,6 +801,9 @@ class MerchantApp:
                     new_config.autostart)
 
         # 日志目录变了就换文件，后续日志写到新位置
+        # 强制直连开关变化要立刻生效/撤销
+        if new_config.force_direct:
+            netdirect.install()
         if (new_config.log_dir or "").strip() != old_log_dir:
             _, warning = applog.resolve_log_dir(new_config)
             path = applog.setup(new_config)

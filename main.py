@@ -48,6 +48,7 @@ def main() -> int:
 
     import applog
     import autostart
+    import netdirect
     import notifier_native
     import single_instance
     from config import Config
@@ -79,6 +80,10 @@ def main() -> int:
         pass
 
     config = Config.load()
+
+    # 第一件事就把代理链路断开：代理变量、系统代理、fake-ip 都在后面统一处理
+    if config.force_direct:
+        netdirect.install()
 
     # 先起日志：后面任何一步出错都能留证据（打包成无控制台 exe 后尤其重要）
     try:

@@ -18,6 +18,8 @@ import queue
 import threading
 import urllib.error
 import urllib.request
+
+import netdirect
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
@@ -69,13 +71,14 @@ class IconCache:
             return None
         with self._lock:
             self.misses += 1
+        # 图标同样走直连：否则系统 DNS 的 fake-ip 会把图片请求也送进代理
         try:
-            request = urllib.request.Request(
-                url, headers={"User-Agent": _UA, "Referer": "https://wiki.biligame.com/"}
+            data, _route = netdirect.fetch_bytes(
+                url,
+                {"User-Agent": _UA, "Referer": "https://wiki.biligame.com/"},
+                timeout=20,
             )
-            with urllib.request.urlopen(request, timeout=20) as response:
-                data = response.read()
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        except (netdirect.DirectError, OSError):
             return None
         if len(data) < 64:
             return None

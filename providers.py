@@ -18,6 +18,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
+import netdirect
 from config import Config
 from models import MerchantItem, MerchantSnapshot
 from rarity import infer_rarity
@@ -200,6 +201,7 @@ class BaseProvider:
     def __init__(self, conf: dict[str, Any], timeout: int = 15) -> None:
         self.conf = conf or {}
         self.timeout = timeout
+        self.route: dict[str, Any] = {}
 
     # -- 便于子类读取 --
     @property
@@ -214,32 +216,37 @@ class BaseProvider:
     def label(self) -> str:
         return str(self.conf.get("label") or self.default_label)
 
+    @property
+    def preferred_ip(self) -> str:
+        """手动指定的建连 IP（绕过 DNS/CDN 归属不理想时用）。"""
+        return str(self.conf.get("preferred_ip") or "").strip()
+
     def is_configured(self) -> bool:
         return bool(self.base_url)
 
     # -- HTTP --
-    def _request(self, url: str, headers: dict[str, str] | None = None) -> Any:
+    def _request(self, url: str, headers: dict[str, str] | None = None,
+                 use_doh: bool = True) -> Any:
+        """直连请求：不走任何代理，DoH 取真实 IP，TLS 校验照旧。
+
+        路由信息挂在 `self.route` 上，供界面显示"出口是否被代理接管"。
+        """
         merged = {
-            "User-Agent": "RocoMerchantAssistant/1.0 (+desktop; python-urllib)",
+            "User-Agent": "RocoMerchantAssistant/1.4 (+desktop; direct-tls)",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
         if headers:
             merged.update(headers)
-        request = urllib.request.Request(url, headers=merged)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            raise ProviderError(f"HTTP {exc.code}：{url}") from exc
-        except urllib.error.URLError as exc:
-            raise ProviderError(f"网络不可达：{exc.reason}") from exc
-        except TimeoutError as exc:
-            raise ProviderError(f"请求超时（{self.timeout}s）") from exc
-        try:
-            return json.loads(body.decode("utf-8", errors="replace"))
-        except json.JSONDecodeError as exc:
-            raise ProviderError("返回内容不是合法 JSON，可能被网关拦截或需要鉴权") from exc
+            payload, trace = netdirect.fetch_json(
+                url, merged, timeout=self.timeout,
+                use_doh=use_doh, prefer_ip=self.preferred_ip,
+            )
+        except netdirect.DirectError as exc:
+            raise ProviderError(str(exc)) from exc
+        self.route = trace
+        return payload
 
     def fetch(self) -> MerchantSnapshot:  # pragma: no cover - 由子类实现
         raise NotImplementedError
@@ -346,6 +353,24 @@ class ShallowProvider(BaseProvider):
 # ---------------------------------------------------------------------------
 # 自定义接口
 # ---------------------------------------------------------------------------
+class CnMirrorProvider(BaseProvider):
+    """自建的大陆反向代理：把社区镜像的数据转发到国内服务器上。
+
+    目标 IP 落在中国大陆，路由器端分流规则会放行直连，流量不经过 VPN 节点；
+    同时链路只有 PC → 国内服务器 → Cloudflare，少一跳跨境。
+    """
+
+    id = "cn_mirror"
+    default_label = "大陆反代 · 自建"
+
+    def fetch(self) -> MerchantSnapshot:
+        payload = self._request(self.base_url)
+        snapshot = snapshot_from_payload(payload, self.id, self.label)
+        if not snapshot.items:
+            raise ProviderError("未能从返回值里识别出商品列表（反代是否只转发了首页？）")
+        return snapshot
+
+
 class CustomProvider(BaseProvider):
     id = "custom"
     default_label = "自定义接口"
@@ -414,6 +439,7 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
 # ---------------------------------------------------------------------------
 _REGISTRY: dict[str, type[BaseProvider]] = {
     "official": OfficialProvider,
+    "cn_mirror": CnMirrorProvider,
     "rkw": RkwProvider,
     "yxsr": YxsrProvider,
     "shallow": ShallowProvider,
@@ -435,15 +461,34 @@ def available_providers(config: Config) -> list[tuple[str, str, bool]]:
     return result
 
 
+_REGION_RANK = {"cn": 0, "": 1, "overseas": 2}
+
+
+def _region_rank(config: Config, pid: str) -> int:
+    """区域排序权重：大陆 0 < 未知 1 < 境外 2。"""
+    region = str(config.provider_conf(pid).get("region") or "")
+    return _REGION_RANK.get(region, 1)
+
+
+def provider_regions(config: Config) -> dict[str, str]:
+    """供界面展示：渠道 id → 区域标签。"""
+    return {
+        pid: str(config.provider_conf(pid).get("region") or "")
+        for pid in config.provider_order()
+    }
+
+
 def fetch_snapshot(config: Config) -> tuple[MerchantSnapshot, list[str]]:
     """按配置拉取数据，返回 (快照, 错误信息列表)。"""
     order: list[str] = []
     primary = config.provider
     order.append(primary)
     if config.auto_fallback:
-        for pid in config.provider_order():
-            if pid not in order:
-                order.append(pid)
+        rest = [pid for pid in config.provider_order() if pid != primary]
+        if config.prefer_cn_region:
+            # 大陆渠道优先尝试：目标 IP 在境内时路由器不会转发到代理节点，链路更短更稳
+            rest = sorted(rest, key=lambda pid: _region_rank(config, pid))
+        order.extend(rest)
 
     errors: list[str] = []
     for pid in order:
@@ -465,6 +510,13 @@ def fetch_snapshot(config: Config) -> tuple[MerchantSnapshot, list[str]]:
             continue
         snapshot.source_id = pid
         snapshot.source_label = provider.label
+        snapshot.route = dict(getattr(provider, "route", {}) or {})
+
+        # 出口校验：多一次轻量请求，但能把"是否被代理接管"变成可测的事实
+        if config.verify_egress:
+            snapshot.route["egress"] = netdirect.egress_of(
+                snapshot.route.get("host", ""), timeout=6
+            ) if snapshot.route.get("host") else {"ok": False}
         return snapshot, errors
 
     raise ProviderError("\n".join(errors) if errors else "没有可用的数据渠道，请到设置里填写接口地址")

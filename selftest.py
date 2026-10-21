@@ -571,6 +571,141 @@ def test_tk_error_hook():
     root.destroy()
 
 
+def test_netdirect_proxy_strip():
+    """直连层第一道：代理环境变量被剥离，urllib 不再报告系统代理。"""
+    import os
+
+    import netdirect
+
+    saved = {k: os.environ.get(k) for k in netdirect.PROXY_ENV_KEYS}
+    try:
+        os.environ["http_proxy"] = "http://127.0.0.1:7890"
+        os.environ["https_proxy"] = "http://127.0.0.1:7890"
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+
+        import urllib.request
+
+        before = urllib.request.getproxies()
+        check("剥离前确实能读到代理", bool(before), str(before))
+
+        removed = netdirect.install()
+        check("代理变量被移除", {"http_proxy", "https_proxy"} <= set(removed), str(removed))
+        check("环境里不再有代理变量",
+              not any(k in os.environ for k in ("http_proxy", "https_proxy")),
+              str(netdirect.proxy_env_snapshot()))
+        check("getproxies 返回空", urllib.request.getproxies() == {},
+              str(urllib.request.getproxies()))
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_netdirect_addr():
+    """地址判定：fake-ip、中国大陆网段、URL 解析、IP 优选。"""
+    import netdirect
+
+    check("fake-ip 能识别", netdirect.is_fake_ip("198.18.1.112"))
+    check("保留段能识别", netdirect.is_fake_ip("127.0.0.1") and netdirect.is_fake_ip("10.0.0.1"))
+    check("真实公网 IP 不算 fake", not netdirect.is_fake_ip("104.21.43.145"))
+
+    check("大陆 IP 判定（电信 DNS）", netdirect.is_cn_ip("223.5.5.5"))
+    check("大陆 IP 判定（腾讯 DoH）", netdirect.is_cn_ip("1.12.12.12"))
+    check("境外 IP 判定（Cloudflare）", not netdirect.is_cn_ip("104.21.43.145"))
+    check("CDN 不会误判", not netdirect.is_cn_ip("8.8.8.8"))
+    check("非法输入不抛异常", not netdirect.is_cn_ip("不是 IP") and not netdirect.is_cn_ip(""))
+
+    scheme, host, path, port = netdirect.split_url(
+        "https://example.com:8443/a/b?x=1"
+    )
+    check("URL 解析", (scheme, host, path, port) == ("https", "example.com", "/a/b?x=1", 8443),
+          f"{scheme} {host} {path} {port}")
+
+    try:
+        netdirect.split_url("ftp://x/y")
+        check("拒绝非 http 协议", False)
+    except netdirect.DirectError:
+        check("拒绝非 http 协议", True)
+
+    check("优先选大陆 IP",
+          netdirect._pick_ip(["104.21.43.145", "223.5.5.5"]) == "223.5.5.5")
+    check("显式指定 IP 优先",
+          netdirect._pick_ip(["104.21.43.145", "223.5.5.5"], "104.21.43.145") == "104.21.43.145")
+
+
+def test_netdirect_doh():
+    """直连层第二道：DoH 取得的是真实 IP，且能识别被劫持的系统 DNS。"""
+    import netdirect
+
+    netdirect.install()
+    netdirect.clear_dns_cache()
+
+    ips = netdirect.resolve("doh.pub", use_doh=True)
+    check("DoH 能解析域名", bool(ips), str(ips))
+    check("DoH 结果里没有 fake-ip", all(not netdirect.is_fake_ip(ip) for ip in ips), str(ips))
+    check("DoH 结果是大陆 IP", all(netdirect.is_cn_ip(ip) for ip in ips), str(ips))
+
+    # 缓存：第二次不应再发请求（用同一个值即可验证）
+    check("解析结果被缓存", netdirect.resolve("doh.pub") == ips)
+
+    report = netdirect.diagnose("doh.pub", timeout=10)
+    check("诊断结构完整",
+          {"system_ips", "doh_ips", "target_is_cn", "verdict", "advice"} <= set(report),
+          str(sorted(report)))
+    check("诊断认为腾讯 DoH 在大陆", report["target_is_cn"], str(report["target_ip"]))
+
+
+def test_clash_rules():
+    """直连规则生成：域名与 DoH 引导 IP 都要 DIRECT，且顺序在代理规则之前。"""
+    import netdirect
+
+    hosts = ["rocokingdomworld.org"]
+    rules = netdirect.clash_rules(hosts)
+    check("规则含域名直连", "DOMAIN-SUFFIX,rocokingdomworld.org,DIRECT" in rules, rules[:120])
+    check("规则含 DoH 引导直连", "IP-CIDR,223.5.5.5/32,DIRECT,no-resolve" in rules)
+    check("规则首行是 rules:",
+          rules.strip().splitlines()[0].strip() == "rules:",
+          rules.splitlines()[0])
+    check("空输入不报错", "rules:" in netdirect.clash_rules([]))
+
+    extracted = netdirect.default_hosts(
+        {"a": {"base_url": "https://a.example.com/x"}, "b": {"base_url": ""}}
+    )
+    check("能从渠道配置提取主机名", extracted == ["a.example.com"], str(extracted))
+
+
+def test_cn_mirror_provider():
+    """大陆反代渠道：未配置时跳过，配好后能识别为大陆。"""
+    from config import Config
+    from providers import build_provider
+
+    config = Config()
+    config.providers.setdefault("cn_mirror", {})["base_url"] = ""
+    provider = build_provider("cn_mirror", config)
+    check("大陆反代为未配置状态", not provider.is_configured())
+
+    order = config.provider_order()
+    check("大陆反代排在社区镜像之前", order.index("cn_mirror") < order.index("rkw"), str(order))
+
+    check("新增网络配置项存在",
+          all(hasattr(config, name) for name in
+              ("force_direct", "doh_enabled", "prefer_cn_region", "verify_egress")),
+          "字段缺失")
+
+
+def test_route_on_snapshot():
+    """快照要带上路由信息，界面才能显示出口。"""
+    from models import MerchantSnapshot
+
+    snap = MerchantSnapshot(items=[])
+    check("快照有 route 字段", isinstance(snap.route, dict), str(type(snap.route)))
+    snap.route = {"ip": "223.5.5.5", "is_cn": True}
+    check("route 可写入", snap.route["is_cn"] is True)
+
+
 def test_main_window_geometry():
     """主窗口位置恢复：副屏位置不能被误判为"越界"。"""
     from monitors import enum_monitors
@@ -752,6 +887,8 @@ def _run_all():
                test_single_instance, test_floating_window, test_config_roundtrip,
                test_notify_fallback_chain, test_monitor_math,
                test_floating_multimonitor, test_logging, test_tk_error_hook,
+               test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
+               test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,
                test_main_window_geometry,
                test_floating_icon_switch, test_tray_icon, test_close_to_tray_switch):
         try:

@@ -60,6 +60,36 @@
 - 内置查看器：设置 →「错误日志」→「查看错误日志」，支持**只看错误**、刷新、清空、打开所在文件夹；托盘右键菜单也有入口
 - 捕获三类异常：主线程未捕获异常、子线程未捕获异常（托盘 / 图标下载）、Tk 控件回调异常（默认只往 stderr 打，打包后等于静默丢失）
 
+### 网络直连（绕开 shellclash 等代理）
+
+程序默认不允许任何代理接管流量，三层分别处理：
+
+| 层次 | 手段 | 能不能做到 |
+| --- | --- | --- |
+| HTTP 代理（`http_proxy` / 系统代理 / Clash 7890） | 启动即清空代理变量，并让 `urllib.getproxies()` 恒返回空 | ✅ 完全可控 |
+| DNS 劫持（Clash fake-ip 把域名解析成 `198.18.x.x`） | 内置 DoH（腾讯 DNSPod / 阿里 AliDNS，引导 IP 写死），取得真实 IP 后按 IP 直连，TLS 的 SNI 与证书校验仍按域名 | ✅ 完全可控 |
+| 透明代理（路由器 TProxy / REDIRECT 改写 TCP） | **客户端无法解决** | ❌ 协议事实 |
+
+第三层不是没做好，是做不到：包在你电脑上时路由器已经决定了它的去向。实测同一台机器：
+
+```
+https://myip.ipip.net   → 180.137.128.120（中国 广西 电信）   ← 大陆目标走直连
+https://ipinfo.io       → 208.87.242.163（US, Psychz）        ← 境外目标被塞进节点
+API 的 /cdn-cgi/trace    → ip=208.87.242.163 colo=LAX         ← 即使按真实 IP 直连也一样
+```
+
+所以真正有效的解法是**让目标落在中国大陆**：Clash 的 `GEOIP,CN,DIRECT` 会放行。
+社区镜像托管在 Cloudflare（境外），必然被转发；要满足"接口在大陆"，就得自建一个境内反代——
+完整做法（Nginx / 云函数两套配置）见 **[docs/cn-mirror.md](docs/cn-mirror.md)**。
+
+不想自建的话，退路是在路由器侧加 DIRECT 规则（唯一能对抗 TProxy 的手段）：
+设置 → 网络直连 → **复制直连规则**，粘到 shellclash 自定义规则里，放在代理规则之前。
+
+界面上的验证入口：
+
+- 工具栏「网络」按钮 → 诊断面板，逐渠道显示系统 DNS / DoH 真实 IP / 目标归属 / **真实出口国家**
+- 状态栏常驻显示 `出口 US/LAX · 已被代理转发` 或 `直连 x.x.x.x · 中国大陆`
+
 ### 开机自启
 - 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，无需管理员权限
 - 写入的是启动命令：exe 运行写 exe 路径，源码运行写 `pythonw.exe main.py`（不闪黑框）
@@ -74,12 +104,23 @@
 | 渠道 id | 说明 | 需 Key |
 | --- | --- | --- |
 | `official` | **官方接口预留位**，地址默认为空；填入后最优先调用 | 否 |
+| `cn_mirror` | **大陆反代 · 自建**，填自己的境内反代地址；填好后优先使用，目标在大陆不会被代理转发 | 否 |
 | `rkw` | 社区镜像（聚合自第三方工具站），字段最全：价格 / 限购 / 图标 / 轮次 / 下次刷新。**默认** | 否 |
 | `yxsr` | 社区精简接口，仅商品名 | 否 |
-| `shallow` | 洛克魔法书，第三方付费服务 | 是 |
+| `shallow` | 洛克魔法书，第三方付费服务；**服务器在中国大陆**（实测 `124.226.74.x`，140ms），是现有渠道里唯一天然满足「接口在境内」的 | 是 |
 | `custom` | 自定义接口，任意返回 JSON 的地址都可接入 | 视情况 |
 
-自动降级：`official（若已填）→ rkw → yxsr → shallow（若已填 Key）→ custom`。
+自动降级：`official（若已填）→ cn_mirror（若已填）→ rkw → yxsr → shallow（若已填 Key）→ custom`。
+
+开启「优先大陆渠道」后，降级顺序会按渠道所在地重排：**大陆渠道优先尝试**
+（`cn_mirror` / `shallow`），境外渠道排在后面。显式选中的当前渠道始终排在第一位。
+
+实测对比（同一台机器、同一时刻）：
+
+| 渠道 | 建连目标 | 是否大陆 | 延迟 | 出口 |
+| --- | --- | --- | --- | --- |
+| `rkw` | `104.21.43.145`（Cloudflare） | 否 | 419–590ms | 经 VPN 节点（US/LAX） |
+| `shallow` | `124.226.74.51`（广西电信） | **是** | **140ms** | 大陆直连 |
 
 社区接口由第三方维护，随时可能变更。失效时改 `providers.rkw.base_url` 即可，不必改代码。
 
@@ -174,6 +215,10 @@ exe 与源码运行**共用同一份配置**。
 | `provider` | `rkw` | 当前数据渠道 |
 | `auto_fallback` | `true` | 失败时自动降级 |
 | `request_timeout` | `15` | 单次请求超时（秒） |
+| `force_direct` | `true` | 剥离代理变量 + 禁用系统代理，全进程不走 HTTP 代理 |
+| `doh_enabled` | `true` | 用 DoH 取真实 IP，绕开 fake-ip 劫持 |
+| `prefer_cn_region` | `true` | 优先选择中国大陆渠道 |
+| `verify_egress` | `true` | 每次查询校验真实出口（多一次轻量请求） |
 | `query_times` | `["08:05","12:05","16:05","20:05"]` | 定时查询时间点 |
 | `notify_enabled` | `true` | 通知总开关 |
 | `notify_min_level` | `4` | 提醒阈值：3 稀有 / 4 史诗 / 5 传说 |
@@ -217,7 +262,7 @@ roco-merchant/
 ├── notifier.py             # 通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
 ├── notifier_native.py      # WinRT Toast、AppUserModelID、rocomesh:// 协议注册
 ├── applog.py               # 日志与异常钩子
-├── selftest.py             # 自测（95 项）
+├── selftest.py             # 自测（127 项）
 ├── tools/make_icon.py      # 纯标准库生成 assets/app.ico
 ├── tools/release.py        # 发布：上传 exe 到 Release + 归档旧版
 ├── .github/workflows/release.yml  # CI：推 tag 自动打包发布
@@ -240,7 +285,7 @@ roco-merchant/
 python selftest.py
 ```
 
-覆盖 95 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
+覆盖 127 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
 通知 XML 与去重、图标缓存与迁移、缓存/日志目录回退、自启命令拼装、单实例互斥与唤醒、
 悬浮窗渲染与收起、多屏边界（合成三屏，含左侧负坐标副屏）、真实双屏下的副屏落位与持久化、
 托盘创建与清理、关闭到托盘后仍能恢复、界面异常落盘、悬浮窗图标开关（开/关后行数与文字不变）。
