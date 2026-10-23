@@ -125,11 +125,26 @@ class SettingsDialog(tk.Toplevel):
             selectcolor=SURFACE_2, font=ui_font(9), bd=0, highlightthickness=0,
         ).pack(anchor="w", pady=(10, 0))
 
+        tune = tk.Frame(holder, bg=SURFACE)
+        tune.pack(fill="x", pady=(8, 0))
+        tk.Label(tune, text="仅剩全天商品时：延后", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left")
+        self._recheck_delay_var = tk.StringVar(value=str(self._draft.recheck_delay_seconds))
+        _entry(tune, self._recheck_delay_var, width=6).pack(side="left", ipady=4, padx=(6, 4))
+        tk.Label(tune, text="秒重取，最多", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left")
+        self._recheck_max_var = tk.StringVar(value=str(self._draft.recheck_max_attempts))
+        _entry(tune, self._recheck_max_var, width=4).pack(side="left", ipady=4, padx=(6, 4))
+        tk.Label(tune, text="次（0 = 关闭该判据）", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left")
+
         tk.Label(
             holder,
             text="提示：商人在 08:00 / 12:00 / 16:00 / 20:00 换货，默认取整点后 5 分钟查询。"
                  "接口有缓存，刚换货时可能仍返回上一轮的货架——开启上面的选项后，"
-                 "程序会按 30/60/120/180/240 秒重试，拿到新一轮数据才停下。",
+                 "接口轮次落后时按 30/60/120/180/240 秒阶梯重试；"
+                 "若货架只剩全天在售的商品（条件球这类）且内容与上次完全相同，"
+                 "则按上面的秒数延后重取，最多重取指定次数。",
             bg=SURFACE, fg=MUTED, font=ui_font(8), justify="left", wraplength=580,
         ).pack(fill="x", pady=(6, 0))
 
@@ -550,6 +565,28 @@ class SettingsDialog(tk.Toplevel):
             self._error.configure(text="时间格式不对，示例：08:05, 12:05, 16:05, 20:05")
             return
 
+        # 重取节奏：填错就拦下来，别让一次手滑把查询打成洪水或彻底关死
+        try:
+            delay = int(str(self._recheck_delay_var.get()).strip())
+        except (TypeError, ValueError):
+            self._error.configure(
+                text="重取间隔要填整数秒，例如 300（= 5 分钟）", fg=theme.DANGER)
+            return
+        if not 30 <= delay <= 3600:
+            self._error.configure(
+                text="重取间隔需在 30 ~ 3600 秒之间（推荐 300 = 5 分钟）", fg=theme.DANGER)
+            return
+        try:
+            attempts = int(str(self._recheck_max_var.get()).strip())
+        except (TypeError, ValueError):
+            self._error.configure(
+                text="最多重取次数要填整数，例如 3", fg=theme.DANGER)
+            return
+        if not 0 <= attempts <= 10:
+            self._error.configure(
+                text="最多重取次数需在 0 ~ 10 之间（0 = 关闭该判据）", fg=theme.DANGER)
+            return
+
         self._store_provider_fields(self._current_pid)
 
         draft = self._draft
@@ -557,6 +594,8 @@ class SettingsDialog(tk.Toplevel):
         draft.provider = self._current_pid
         draft.auto_fallback = bool(self._fallback_var.get())
         draft.auto_recheck_after_refresh = bool(self._recheck_var.get())
+        draft.recheck_delay_seconds = delay
+        draft.recheck_max_attempts = attempts
         draft.force_direct = bool(self._direct_var.get())
         draft.doh_enabled = bool(self._doh_var.get())
         draft.prefer_cn_region = bool(self._cn_var.get())

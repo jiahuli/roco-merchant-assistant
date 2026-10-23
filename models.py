@@ -84,6 +84,7 @@ class MerchantSnapshot:
     message: str = ""
     route: dict = field(default_factory=dict)   # 直连路由信息（IP / 是否大陆 / 延迟）
     expected_round: Optional[int] = None        # 按本地时间应当处于第几轮
+    dropped_count: int = 0                      # 因轮次不符被剔除的条目数（诊断用）
 
     @property
     def is_round_lagging(self) -> bool:

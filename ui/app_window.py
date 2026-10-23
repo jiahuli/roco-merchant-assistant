@@ -15,6 +15,8 @@ import monitors
 import netdirect
 import tray as tray_module
 from config import Config, resolve_icon_cache_dir, resource_path, state_path
+from freshness import (ACTION_NONE, CODE_ROUND_LAG, CODE_SHELF_SHRANK, ShelfObservation,
+                       ShelfWatcher, format_delay)
 from models import MerchantSnapshot
 from notifier import Notifier
 from providers import CN_TZ, ProviderError, fetch_snapshot, next_refresh_at
@@ -30,6 +32,8 @@ from ui.widgets import ItemCard, PillButton, ScrollFrame, StatBlock, StatusPill
 class MerchantApp:
     # 换货后接口缓存可能还没跟上：依次等待这些秒数重试，合计约 10 分钟
     ROUND_RETRY_DELAYS = (30, 60, 120, 180, 240)
+    # 重试链专用标记：带这个原因触发的 refresh 不清空重试计数
+    RETRY_REASON = "换货校验重试"
 
     def __init__(self, root: tk.Tk, config: Config) -> None:
         self.root = root
@@ -48,6 +52,14 @@ class MerchantApp:
         self._show_requests: queue.Queue = queue.Queue()
         self._round_retry = 0
         self._round_retry_job: str | None = None
+        # 货架新鲜度判定：记住上一次的结果，判断这次是不是"其实没换货"
+        self._watcher = ShelfWatcher(
+            round_delays=self.ROUND_RETRY_DELAYS,
+            delay=config.recheck_delay_seconds,
+            max_attempts=config.recheck_max_attempts,
+        )
+        self._shelf_state_key: tuple[str, int | None] | None = None
+        self._restore_shelf_state()
         self._pump_job: str | None = None
         self._tray_commands: queue.Queue = queue.Queue()
         self.tray: tray_module.TrayIcon | None = None
@@ -403,9 +415,11 @@ class MerchantApp:
     def refresh(self, reason: str = "手动刷新") -> None:
         if self._loading:
             return
-        if reason != "换货校验重试":
-            # 用户主动刷新 / 定时查询：重试计数归零，重新给足机会
+        if reason != self.RETRY_REASON:
+            # 用户主动刷新 / 定时查询：盖掉还没触发的那次重取，并重新给足预算
+            self._cancel_round_retry()
             self._round_retry = 0
+            self._watcher.reset_attempts()
         self._loading = True
         self.refresh_btn.set_enabled(False)
         self.refresh_btn.set_text("查询中…")
@@ -435,6 +449,9 @@ class MerchantApp:
         lag = ""
         if snapshot.is_round_lagging:
             lag = f"·滞后(应第{snapshot.expected_round}轮)"
+        dropped = getattr(snapshot, "dropped_count", 0) or 0
+        if dropped:
+            lag += f"·剔除旧轮 {dropped} 件"
         applog.info("查询成功 | %s | 第%s轮%s | %s 件(全天 %s) | 更新于 %s | 目标 %s(%s) 出口 %s %s",
                     snapshot.source_label, snapshot.round_index, lag,
                     len(snapshot.items), snapshot.all_day_count,
@@ -458,7 +475,8 @@ class MerchantApp:
                      f"{snapshot.fetched_at.strftime('%H:%M:%S')} 更新",
                 fg=MUTED,
             )
-        self._check_round_lag(snapshot, reason)
+        self._evaluate_freshness(snapshot, reason)
+        self._remember_shelf(snapshot)
         self._maybe_notify(snapshot)
 
     def _cancel_round_retry(self) -> None:
@@ -469,50 +487,132 @@ class MerchantApp:
                 pass
             self._round_retry_job = None
 
-    def _check_round_lag(self, snapshot: MerchantSnapshot, reason: str) -> None:
-        """换货校验：接口还在给上一轮的货架时，短间隔重试直到换货。
+    def _schedule_recheck(self, delay: float) -> None:
+        """排一次重取；同一时刻只允许有一条重取链在跑。"""
+        self._cancel_round_retry()
+        try:
+            self._round_retry_job = self.root.after(
+                max(50, int(max(0.05, delay) * 1000)), self._run_recheck
+            )
+        except (tk.TclError, ValueError):
+            self._round_retry_job = None
 
-        这是"八点换货后新商品不出现、未刷新的全天商品一直在"的根因：
-        接口有缓存，换货瞬间查到的还是旧轮次；原实现只在固定时间点查一次，
-        查到旧数据也照样渲染，之后要等到下一个整点才再查。
+    def _run_recheck(self) -> None:
+        self._round_retry_job = None
+        if getattr(self, "_closing", False) or self._quitting:
+            return
+        if self._loading:
+            # 正有一次查询在路上（用户点了刷新、或定时任务刚触发）：
+            # 等它结束再来，且不消耗重取次数——否则重取链会悄无声息地断掉
+            self._schedule_recheck(min(15.0, max(5.0, self._watcher.delay)))
+            return
+        self.refresh(reason=self.RETRY_REASON)
+
+    def _evaluate_freshness(self, snapshot: MerchantSnapshot, reason: str) -> None:
+        """这次的货架到底新不新鲜？不新鲜就按可配置的节奏重取。
+
+        1.4.1 只看"接口轮次是否落后"，漏掉了两种更难发现的"假刷新"：
+        `round` 已刷成新轮次但货架内容还是旧的；以及接口根本不返回 `round`、
+        只能拿本地时间兜底的渠道。这两种情况下 `is_round_lagging` 恒为 False，
+        程序不重试；再叠加 `filter_by_round()` 把旧轮次的商品剔掉，界面就
+        只剩「全天在售」的那两件，之后要等下一个整点才再查——这就是
+        "卡在两个全天售卖物品上、刷不出新物品"的成因。
+
+        现在补上"内容比对"这条判据（见 freshness.ShelfWatcher）：货架只剩
+        全天商品、且与上次完全相同时，按 `recheck_delay_seconds` 延后重取，
+        最多 `recheck_max_attempts` 次。判据只在"只剩全天商品"时生效，
+        带本轮商品的正常货架仍只受老逻辑约束。
         """
         self._cancel_round_retry()
 
         if not self.config.auto_recheck_after_refresh:
-            return
-        if snapshot.status != "open" or not snapshot.is_round_lagging:
-            if self._round_retry:
-                applog.info("接口已换到第 %s 轮，停止重试（共试 %s 次）",
-                            snapshot.round_index, self._round_retry)
-                self._round_retry = 0
+            self._round_retry = 0
             return
 
-        if self._round_retry >= len(self.ROUND_RETRY_DELAYS):
-            applog.warning(
-                "换货校验放弃 | 接口仍为第 %s 轮（本地应为第 %s 轮），已重试 %s 次；"
-                "界面展示的是接口给的数据，可稍后手动刷新",
-                snapshot.round_index, snapshot.expected_round, self._round_retry)
-            self.status_left.configure(
-                text=f"{reason} · 接口尚未换货（仍为第 {snapshot.round_index} 轮），"
-                     f"已重试 {self._round_retry} 次，稍后可手动刷新",
-                fg=WARNING,
-            )
-            self.pill.set_state("数据滞后", WARNING)
+        decision = self._watcher.observe(snapshot)
+        self._round_retry = decision.attempt if decision.action != ACTION_NONE else 0
+
+        if decision.action == ACTION_NONE:
+            if decision.code and decision.limit > 0:
+                # 同一份内容这一轮已经放弃过：不再请求，但界面继续标注"可能没更新"，
+                # 否则下一次渲染会把警告悄悄抹掉，看着像数据已经更新了
+                self._show_recheck_give_up(snapshot, reason, decision, quiet=True)
+                return
+            if reason == self.RETRY_REASON:
+                applog.info("换货校验结束 | 第 %s 轮 | %s 件，数据可信",
+                            snapshot.round_index, len(snapshot.items))
             return
 
-        delay = self.ROUND_RETRY_DELAYS[self._round_retry]
-        self._round_retry += 1
-        applog.info("换货校验 | 接口为第 %s 轮 / 本地应为第 %s 轮，%s 秒后第 %s 次重试",
-                    snapshot.round_index, snapshot.expected_round, delay, self._round_retry)
+        if decision.is_give_up:
+            self._show_recheck_give_up(snapshot, reason, decision)
+            return
+
+        self._show_recheck_pending(snapshot, reason, decision)
+        applog.info("换货校验 | %s | 第 %s 轮 | %s 件 | %s 秒后第 %s/%s 次重取",
+                    decision.code_text, snapshot.round_index, len(snapshot.items),
+                    int(decision.delay), decision.attempt, decision.limit)
+        self._schedule_recheck(decision.delay)
+
+    def _show_recheck_pending(self, snapshot: MerchantSnapshot, reason: str, decision) -> None:
+        """重取已排程：状态栏 + 药丸 + 货架标题三处同时说明原因。"""
+        delay_text = format_delay(decision.delay)
+        count = len(snapshot.items)
+        if decision.code == CODE_ROUND_LAG:
+            detail = f"接口还在第 {snapshot.round_index} 轮"
+            note = (f"⚠ 接口仍是第 {snapshot.round_index} 轮"
+                    f"（应为第 {snapshot.expected_round} 轮），正在重试")
+        elif decision.code == CODE_SHELF_SHRANK:
+            detail = f"本轮商品全部消失，只剩 {count} 件全天商品"
+            note = f"⚠ 只剩 {count} 件全天商品，疑似接口还没换货，正在重试"
+        else:
+            detail = f"本轮仅 {count} 件全天商品、与上次完全相同"
+            note = f"⚠ 货架只剩 {count} 件全天商品，疑似接口还没换货，正在重试"
         self.status_left.configure(
-            text=f"{reason} · 接口还在第 {snapshot.round_index} 轮，"
-                 f"{delay} 秒后重试（{self._round_retry}/{len(self.ROUND_RETRY_DELAYS)}）",
+            text=f"{reason} · {detail}，{delay_text}后重试"
+                 f"（{decision.attempt}/{decision.limit}）",
             fg=WARNING,
         )
         self.pill.set_state("换货校验中", WARNING)
-        self._round_retry_job = self.root.after(
-            int(delay * 1000), lambda: self.refresh(reason="换货校验重试")
-        )
+        self._set_shelf_note(note)
+
+    def _show_recheck_give_up(self, snapshot: MerchantSnapshot, reason: str,
+                              decision, quiet: bool = False) -> None:
+        """重取次数用完：保留接口给的数据，但明确告诉用户"可能不是新的"。
+
+        `quiet=True` 用于"同一份内容这一轮已放弃过"的重复渲染：只更新界面文案，
+        不再重复写日志、也不排新的重取。
+        """
+        if decision.code == CODE_ROUND_LAG:
+            if not quiet:
+                applog.warning(
+                    "换货校验放弃 | 接口仍为第 %s 轮（本地应为第 %s 轮），已重试 %s 次；"
+                    "界面展示的是接口给的数据，可稍后手动刷新",
+                    snapshot.round_index, snapshot.expected_round, decision.limit)
+            text = (f"{reason} · 接口尚未换货（仍为第 {snapshot.round_index} 轮），"
+                    f"已重试 {decision.limit} 次，稍后可手动刷新")
+            note = f"⚠ 接口仍是第 {snapshot.round_index} 轮，数据可能未更新"
+        else:
+            if not quiet:
+                applog.warning(
+                    "换货校验放弃 | 连续 %s 次只拿到 %s 件全天商品（%s）；"
+                    "如仍看不到新商品，可稍后手动刷新或检查接口缓存",
+                    decision.limit, len(snapshot.items), decision.code_text)
+            text = (f"{reason} · 连续 {decision.limit} 次都只有 {len(snapshot.items)} 件"
+                    f"全天商品，接口可能还没换货，稍后可手动刷新")
+            note = f"⚠ 只有 {len(snapshot.items)} 件全天商品，数据可能未更新"
+        self.status_left.configure(text=text, fg=WARNING)
+        self.pill.set_state("数据滞后", WARNING)
+        self._set_shelf_note(note)
+
+    def _set_shelf_note(self, text: str, fg: str = WARNING) -> None:
+        """货架标题右侧的小字提示；货架还没建出来时安全跳过。"""
+        label = getattr(self, "_shelf_note", None)
+        try:
+            if label is None or not label.winfo_exists():
+                return
+            label.configure(text=text, fg=fg)
+        except tk.TclError:
+            pass
 
     def _on_ui_error(self, name: str, message: str) -> None:
         """界面回调里抛出的异常：状态栏提示 + 首次弹窗，堆栈已由日志钩子记录。"""
@@ -803,10 +903,35 @@ class MerchantApp:
             return {}
 
     def _save_state(self, data: dict) -> None:
+        """合并写回，避免一处写入把另一处的状态（通知去重 / 货架指纹）冲掉。"""
+        merged = self._load_state()
+        merged.update(data)
         try:
-            state_path().write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            state_path().write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
         except OSError:
             pass
+
+    def _restore_shelf_state(self) -> None:
+        """读回上次运行留下的货架指纹，冷启动也能立刻判断"这次是不是没换货"。"""
+        shelf = (self._load_state() or {}).get("shelf")
+        observation = ShelfObservation.from_dict(shelf)
+        if observation is not None:
+            self._watcher.seed(observation)
+            self._shelf_state_key = (observation.content, observation.round_key)
+
+    def _remember_shelf(self, snapshot: MerchantSnapshot) -> None:
+        """把这一轮的货架指纹写盘；内容没变化就不重复写。"""
+        try:
+            observation = ShelfObservation.of(snapshot)
+        except Exception:  # noqa: BLE001 - 落盘失败不该影响界面
+            return
+        if observation.count <= 0:
+            return
+        key = (observation.content, observation.round_key)
+        if key == self._shelf_state_key:
+            return
+        self._shelf_state_key = key
+        self._save_state({"shelf": observation.to_dict()})
 
     # ------------------------------------------------------------------ 交互
     def _open_channel_menu(self) -> None:
@@ -920,6 +1045,15 @@ class MerchantApp:
         self.float_btn.set_text(self._float_text())
 
         self._update_status_right()
+        # 换货校验的节奏可能刚被改过：立刻生效，关掉时顺手撤掉已排程的重取
+        self._watcher.configure(
+            delay=new_config.recheck_delay_seconds,
+            max_attempts=new_config.recheck_max_attempts,
+            round_delays=self.ROUND_RETRY_DELAYS,
+        )
+        if not new_config.auto_recheck_after_refresh:
+            self._cancel_round_retry()
+            self._round_retry = 0
         self.refresh(reason="设置已更新")
 
     # ------------------------------------------------------------------ 托盘

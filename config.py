@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -172,6 +172,9 @@ class Config:
 
     # 换货校验：接口缓存可能落后于本地时间，查到旧轮次时自动重试
     auto_recheck_after_refresh: bool = True
+    # 货架只剩全天商品、且内容与上次完全相同时的重取节奏（接口"假刷新"）
+    recheck_delay_seconds: int = 300     # 延后多久再取一次（默认 5 分钟）
+    recheck_max_attempts: int = 3        # 最多重取几次（0 = 关闭该判据）
 
     # 定时查询（24 小时制 HH:MM）
     query_times: list[str] = field(default_factory=lambda: list(QUERY_TIME_PRESETS["默认（刷新后 5 分钟）"]))
@@ -262,6 +265,10 @@ class Config:
         cfg.query_times = sanitize_times(cfg.query_times)
         if not cfg.query_times:
             cfg.query_times = list(QUERY_TIME_PRESETS["默认（刷新后 5 分钟）"])
+        # 换货重取节奏：夹到可用区间。手改配置写成 "300"/"五分钟" 都不会炸，
+        # 也不会把重取打成每秒一次的洪水
+        cfg.recheck_delay_seconds = clamp_int(cfg.recheck_delay_seconds, 30, 3600, 300)
+        cfg.recheck_max_attempts = clamp_int(cfg.recheck_max_attempts, 0, 10, 3)
         if cfg.provider not in cfg.providers:
             cfg.provider = "rkw"
         return cfg
@@ -281,6 +288,15 @@ class Config:
         """
         order = ["official", "cn_mirror", "rkw", "yxsr", "shallow", "custom"]
         return [p for p in order if p in self.providers]
+
+
+def clamp_int(value: Any, low: int, high: int, default: int) -> int:
+    """把配置里的数字夹进 [low, high]；类型不对就用默认值。"""
+    try:
+        number = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
 
 
 def sanitize_times(times: Any) -> list[str]:

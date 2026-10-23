@@ -353,6 +353,7 @@ class RkwProvider(BaseProvider):
             position=payload.get("position") or payload.get("merchant_pos"),
             fetched_at=moment,
             stale=bool(payload.get("stale")),
+            dropped_count=len(dropped),
         )
 
 
@@ -479,7 +480,7 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
     expected_round = _to_int(
         _first_value(meta, ("expectedRound", "expected_round"))
     ) or round_index_at(moment)
-    items, _dropped = filter_by_round(build_items(_find_items(payload)), round_index)
+    items, dropped = filter_by_round(build_items(_find_items(payload)), round_index)
 
     return MerchantSnapshot(
         items=items,
@@ -492,6 +493,7 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
         next_refresh=(next_refresh or next_refresh_at(moment)).strftime("%Y-%m-%d %H:%M"),
         position=_first_value(meta, ("position", "merchant_pos", "location")),
         fetched_at=moment,
+        dropped_count=len(dropped),
     )
 
 

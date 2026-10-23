@@ -45,9 +45,26 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 - 每件商品带 `rounds` 元组：`(1,2,3,4)` = **全天在售**（条件球、棱镜球这类）；
   `(3,)` = 只在第 3 轮卖。判定入口是 `MerchantItem.is_all_day`。
 - **`snapshot.is_round_lagging`**：`round_index < expected_round` 即为"接口还在上一轮"。
-- 滞后时 `MerchantApp._check_round_lag()` 按 `ROUND_RETRY_DELAYS = (30,60,120,180,240)` 秒重试，
+- 滞后时 `MerchantApp._evaluate_freshness()` 按 `ROUND_RETRY_DELAYS = (30,60,120,180,240)` 秒重试，
   换到新轮次或重试耗尽即停。**这是 1.4.1 修的核心 bug**：之前只在固定时间点查一次，
   查到旧轮次也照样渲染，导致"换货后新商品不出现、全天商品一直在"。
+- **1.4.2 补的坑**：`is_round_lagging` 依赖接口自报 `round`，有两种情况它恒为 False：
+  ① `round` 已刷成新轮次、`items` 还是旧货架；② 渠道根本不返回 `round`，代码用本地时间
+  兜底（`round_index_at()`），算出来的轮次永远"不落后"。这时再叠加 `filter_by_round()`
+  把旧轮次的商品剔掉，货架就只剩 `rounds=(1,2,3,4)` 的全天商品（条件球 / 棱镜球），
+  界面卡在这两件上，且不会触发任何重试——直到下一个定时点（4 小时后）。
+  现在改由 `freshness.ShelfWatcher` 同时看**货架内容**：
+
+  | 判据 | 触发条件 | 节奏 |
+  |---|---|---|
+  | `round_lag` | `is_round_lagging` | 30/60/120/180/240 秒阶梯 |
+  | `all_day_only` | 只剩全天商品 + 与上次内容完全相同 | `recheck_delay_seconds`（默认 300 秒）× `recheck_max_attempts`（默认 3） |
+  | `shelf_shrank` | 只剩全天商品 + 上次还有本轮商品 | 同上 |
+
+  三条判据都要求"只剩全天商品"或"轮次明确落后"，带本轮商品的正常货架不受影响。
+  上一份货架指纹会写进 `state.json` 的 `shelf` 字段（`_remember_shelf()` /
+  `_restore_shelf_state()`），所以冷启动也能比对。同一份内容在同一轮次放弃过一次后
+  不再重取（`ShelfWatcher._exhausted`），跨轮或内容变化后自动恢复。
 
 ---
 
@@ -58,11 +75,12 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | 文件 | 行 | 职责 |
 |---|---|---|
 | `main.py` | 115 | 入口。单实例判定 → `netdirect.install()` → 日志 → 建窗口 → 监听"露面"信号 |
-| `config.py` | 304 | `Config` 数据类 + `DEFAULT_PROVIDERS` + 路径解析 + 图标缓存目录校验 |
-| `models.py` | 119 | `MerchantItem`（含 `rounds` / `is_all_day`）、`MerchantSnapshot`（含 `is_round_lagging`） |
+| `config.py` | 320 | `Config` 数据类 + `DEFAULT_PROVIDERS` + 路径解析 + 图标缓存目录校验 |
+| `models.py` | 120 | `MerchantItem`（含 `rounds` / `is_all_day`）、`MerchantSnapshot`（含 `is_round_lagging`） |
 | `numerals.py` | 80 | 数字 → 中文读法（`3200000` → 三百二十万），无依赖，易测 |
 | `rarity.py` | 109 | 珍惜度五档推断（关键词 → 分类 → 价格三层），官方数据无此字段 |
-| `providers.py` | 583 | 6 个渠道实现 + 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
+| `providers.py` | 585 | 6 个渠道实现 + 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
+| `freshness.py` | 327 | 货架新鲜度判定（轮次落后 / 只剩全天商品 / 本轮商品消失），纯状态机，不碰 Tk |
 | `netdirect.py` | 589 | 直连网络层：剥代理 / DoH / 按 IP 直连 / CN 段判定 / 出口诊断 / Clash 规则生成 |
 | `cache.py` | 275 | 图标两级缓存（磁盘 `sha1(url).png` + 内存 `PhotoImage`）+ 目录迁移 |
 | `scheduler.py` | 124 | 1 秒节拍，到点触发；`next_run()` 计算下一次 |
@@ -78,8 +96,8 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 
 | 文件 | 行 | 职责 |
 |---|---|---|
-| `ui/app_window.py` | 1082 | 主窗口：工具栏 / 货架卡片网格 / 状态栏 / 重试与刷新编排 / 托盘命令消费 |
-| `ui/settings_dialog.py` | 600 | 设置面板（定时 / 渠道 / 网络直连 / 通知 / 悬浮窗 / 缓存 / 日志 / 启动） |
+| `ui/app_window.py` | 1220 | 主窗口：工具栏 / 货架卡片网格 / 状态栏 / 重试与刷新编排 / 托盘命令消费 |
+| `ui/settings_dialog.py` | 639 | 设置面板（定时 / 渠道 / 网络直连 / 通知 / 悬浮窗 / 缓存 / 日志 / 启动） |
 | `ui/floating_window.py` | 392 | 置顶悬浮窗（拖动 / 收起 / 图标开关 / 多屏记忆） |
 | `ui/network_dialog.py` | 198 | 网络与出口诊断面板 |
 | `ui/log_viewer.py` | 185 | 日志查看器 |
@@ -95,7 +113,7 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `tools/release.py` | 发布：建 Release、上传 exe、改固定名、归档旧版 |
 | `tools/make_icon.py` | 纯标准库生成 `assets/app.ico`（手写 PNG + ICO 封装） |
 | `app.spec` | PyInstaller 配置。**新增数据文件必须加进 `datas`**（如 `data/cn_ipv4.txt`），否则打包后功能静默失效 |
-| `selftest.py` | 157 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
+| `selftest.py` | 198 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
 | `docs/cn-mirror.md` | 自建大陆反代（Nginx / 云函数两套配置） |
 | `README.md` | 用户视角文档 |
 | `LICENSE` | MIT |
@@ -117,7 +135,8 @@ scheduler 到点 / 用户点刷新
       → verify_egress 时附一次 /cdn-cgi/trace 结果
   → 回主线程 _on_fetched()
       → _render()            卡片 + 统计 + 滞后提示
-      → _check_round_lag()   轮次落后则排程重试
+      → _evaluate_freshness()  轮次落后 / 货架停滞则排程重试
+      → _remember_shelf()      货架指纹落盘（冷启动也能比对）
       → _maybe_notify()      达到珍惜度阈值且未推过 → 通知
 ```
 
@@ -160,7 +179,7 @@ scheduler 到点 / 用户点刷新
 
 ```bash
 python main.py                 # 跑源码（需 Python 3.9+ 且含 tkinter）
-python selftest.py             # 157 项自测，应输出"失败 0 项"
+python selftest.py             # 198 项自测，应输出"失败 0 项"
 python -m compileall -q .      # 语法检查
 build_exe.bat                  # 装 PyInstaller 并打包到 dist\
 python tools/release.py --asset "dist/远行商人助手.exe" --notes-file docs/release-notes.md
@@ -189,7 +208,9 @@ python tools/release.py --asset "dist/远行商人助手.exe" --notes-file docs/
 |---|---|
 | 接口地址 / 加新渠道 | `config.DEFAULT_PROVIDERS` + `providers.py` 加类并注册进 `_REGISTRY` |
 | 换货时间点 | `providers.ROUND_HOURS` + `config.QUERY_TIME_PRESETS` |
-| 重试节奏 | `ui/app_window.MerchantApp.ROUND_RETRY_DELAYS` |
+| 轮次落后的重试阶梯 | `ui/app_window.MerchantApp.ROUND_RETRY_DELAYS` |
+| 货架停滞的重取节奏 | 设置 →「定时查询」→ 延后秒数 / 最多次数（`config.recheck_delay_seconds` / `recheck_max_attempts`） |
+| 新鲜度判据 | `freshness.ShelfWatcher.observe()` |
 | 珍惜度规则 | `rarity.py` 的 `RARITY_TABLE` 与关键词表 |
 | 通知内容 | `notifier._compose()` |
 | 卡片外观 | `ui/widgets.ItemCard` + `ui/theme.py` 颜色 |

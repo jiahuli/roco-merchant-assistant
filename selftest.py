@@ -1,4 +1,5 @@
 """功能自测：核心逻辑 + 关键交互。"""
+import json
 import os
 import sys
 import time
@@ -378,6 +379,25 @@ def test_config_roundtrip():
         check("老配置向后兼容",
               loaded.query_times == config.query_times and loaded.provider == "rkw")
 
+        # 换货重取节奏：可配置 + 越界/脏数据自动夹回安全区间
+        config.recheck_delay_seconds = 900
+        config.recheck_max_attempts = 5
+        config.save(path)
+        loaded = Config.load(path)
+        check("重取节奏可持久化",
+              loaded.recheck_delay_seconds == 900 and loaded.recheck_max_attempts == 5,
+              f"{loaded.recheck_delay_seconds}/{loaded.recheck_max_attempts}")
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["recheck_delay_seconds"] = "五分钟"
+        raw["recheck_max_attempts"] = 99
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        loaded = Config.load(path)
+        check("脏配置回落默认值", loaded.recheck_delay_seconds == 300,
+              str(loaded.recheck_delay_seconds))
+        check("越界次数被夹到上限", loaded.recheck_max_attempts == 10,
+              str(loaded.recheck_max_attempts))
+
 
 def test_notify_fallback_chain():
     """原生成功时不弹浮窗；原生失败才兜底。"""
@@ -645,8 +665,13 @@ def test_round_retry_flow():
     from models import MerchantItem, MerchantSnapshot
 
     def make_snapshot(round_no: int):
+        items = [MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))]
+        if round_no >= 2:
+            # 换货后货架正常带着本轮商品（只剩全天商品会被"内容比对"判据
+            # 认为可疑，那是另一条测试覆盖的场景）
+            items.append(MerchantItem("血脉药", 100, 1, rounds=(2,)))
         return MerchantSnapshot(
-            items=[MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))],
+            items=items,
             status="open",
             round_index=round_no,
             expected_round=2,
@@ -719,6 +744,293 @@ def test_round_retry_flow():
     finally:
         aw.fetch_snapshot = original_fetch
         aw.MerchantApp.ROUND_RETRY_DELAYS = original_delays
+
+
+def test_shelf_freshness_rules():
+    """1.4.2 新判据：只剩全天商品 + 内容未变 → 判定为"其实没换货"。"""
+    from freshness import (ACTION_GIVE_UP, ACTION_RETRY, CODE_ALL_DAY_ONLY,
+                           CODE_ROUND_LAG, CODE_SHELF_SHRANK, ShelfWatcher)
+
+    def snap(items, rnd=2, exp=2, status="open", src="rkw"):
+        return MerchantSnapshot(items=items, status=status, round_index=rnd,
+                                expected_round=exp, source_id=src)
+
+    def ball():
+        return MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
+
+    def prism():
+        return MerchantItem("棱镜球", 5000, 10, rounds=(1, 2, 3, 4))
+
+    def round_item(name, rnd):
+        return MerchantItem(name, 100, 1, rounds=(rnd,))
+
+    watcher = ShelfWatcher(round_delays=(30, 60), delay=300, max_attempts=2)
+    first = watcher.observe(snap([ball(), prism()]))
+    check("首次拿到全天货架不重取", first.action != ACTION_RETRY, str(first))
+
+    second = watcher.observe(snap([ball(), prism()]))
+    check("内容未变触发重取", second.should_retry and second.code == CODE_ALL_DAY_ONLY, str(second))
+    check("默认延后 5 分钟", second.delay == 300.0, str(second.delay))
+    check("重取次数从 1 开始", second.attempt == 1, str(second.attempt))
+
+    third = watcher.observe(snap([ball(), prism()]))
+    check("第二次仍未变继续重取", third.should_retry and third.attempt == 2, str(third))
+    exhausted = watcher.observe(snap([ball(), prism()]))
+    check("超过上限转为放弃", exhausted.action == ACTION_GIVE_UP, str(exhausted))
+    again = watcher.observe(snap([ball(), prism()]))
+    check("放弃后同一内容不再重复重取", again.action != ACTION_RETRY, str(again))
+
+    fresh = watcher.observe(snap([ball(), prism(), round_item("血脉药", 2)]))
+    check("出现本轮商品即视为可信", fresh.action != ACTION_RETRY, str(fresh))
+
+    # 货架"缩水"：上次还有本轮商品，这次只剩全天商品 → 多半是旧轮次被过滤掉了
+    shrink_watcher = ShelfWatcher(round_delays=(30, 60), delay=300, max_attempts=3)
+    shrink_watcher.observe(snap([ball(), prism(), round_item("血脉药", 2)]))
+    shrank = shrink_watcher.observe(snap([ball(), prism()]))
+    check("本轮商品消失也判为可疑", shrank.should_retry and shrank.code == CODE_SHELF_SHRANK,
+          str(shrank))
+
+    # 轮次判据保持原样：阶梯间隔、条数上限
+    lag_watcher = ShelfWatcher(round_delays=(30, 60), delay=300, max_attempts=3)
+    lag1 = lag_watcher.observe(snap([ball(), round_item("旧药", 1)], rnd=1, exp=2))
+    lag2 = lag_watcher.observe(snap([ball(), round_item("旧药", 1)], rnd=1, exp=2))
+    lag3 = lag_watcher.observe(snap([ball(), round_item("旧药", 1)], rnd=1, exp=2))
+    check("轮次落后走原有阶梯", lag1.delay == 30 and lag2.delay == 60 and lag3.action == ACTION_GIVE_UP,
+          f"{lag1.delay}/{lag2.delay}/{lag3.action}")
+    check("轮次判据标识不变", lag1.code == CODE_ROUND_LAG, lag1.code)
+
+    # 关闭 / 边界
+    off = ShelfWatcher(max_attempts=0)
+    off.observe(snap([ball()]))
+    check("次数配 0 关闭内容判据", not off.observe(snap([ball()])).should_retry)
+
+    closed = ShelfWatcher()
+    closed.observe(snap([ball()], status="closed"))
+    check("打烊不重取", not closed.observe(snap([ball()], status="closed")).should_retry)
+
+    empty = ShelfWatcher()
+    empty.observe(snap([]))
+    check("空货架不重取", not empty.observe(snap([])).should_retry)
+
+    switched = ShelfWatcher()
+    switched.observe(snap([ball()], src="rkw"))
+    check("换渠道后不误判为未变",
+          not switched.observe(snap([ball()], src="custom")).should_retry)
+
+    unknown = ShelfWatcher()
+    unknown.observe(snap([MerchantItem("神秘商品", 100, 1)]))
+    check("无 rounds 字段不误判全天货架",
+          not unknown.observe(snap([MerchantItem("神秘商品", 100, 1)])).should_retry)
+
+    from freshness import format_delay
+    check("延迟文案", format_delay(300) == "5 分钟" and format_delay(45) == "45 秒"
+          and format_delay(90) == "1 分 30 秒",
+          f"{format_delay(300)}/{format_delay(45)}/{format_delay(90)}")
+
+    # 复现被卡住的现场：接口 round 已刷成第 2 轮，items 还是第 1 轮的货架。
+    # filter_by_round() 把 rounds=[1] 的旧商品剔掉，只剩两件全天商品，
+    # 而 is_round_lagging 为 False —— 1.4.1 会认为一切正常，从此不再重试。
+    from providers import snapshot_from_payload
+
+    stale_payload = {
+        "status": "open",
+        "round": 2,
+        "expectedRound": 2,
+        "items": [
+            {"name": "条件球", "price": 3000, "limit": 100, "rounds": [1, 2, 3, 4]},
+            {"name": "棱镜球", "price": 5000, "limit": 10, "rounds": [1, 2, 3, 4]},
+            {"name": "旧轮药水", "price": 100, "limit": 1, "rounds": [1]},
+        ],
+    }
+    stale = snapshot_from_payload(stale_payload, "rkw", "测试渠道")
+    check("卡住的现场：只剩两件全天商品",
+          len(stale.items) == 2 and stale.all_day_count == 2, str([i.name for i in stale.items]))
+    check("剔除数被记录（日志可追溯）", stale.dropped_count == 1, str(stale.dropped_count))
+    check("轮次判据看不出问题（1.4.1 的盲区）", not stale.is_round_lagging)
+
+    stuck = ShelfWatcher(delay=300, max_attempts=2)
+    first_see = stuck.observe(stale)
+    second_see = stuck.observe(snapshot_from_payload(stale_payload, "rkw", "测试渠道"))
+    check("首见不重取", first_see.action != ACTION_RETRY, str(first_see))
+    check("连见两次完全相同 → 触发延后重取",
+          second_see.should_retry and second_see.code == CODE_ALL_DAY_ONLY
+          and second_see.delay == 300, str(second_see))
+
+    healed = {
+        "status": "open", "round": 2, "expectedRound": 2,
+        "items": [
+            {"name": "条件球", "price": 3000, "limit": 100, "rounds": [1, 2, 3, 4]},
+            {"name": "棱镜球", "price": 5000, "limit": 10, "rounds": [1, 2, 3, 4]},
+            {"name": "血脉药", "price": 8000, "limit": 2, "rounds": [2]},
+        ],
+    }
+    check("接口恢复后不再重取",
+          not stuck.observe(snapshot_from_payload(healed, "rkw", "测试渠道")).should_retry)
+
+
+def test_all_day_recheck_flow():
+    """端到端：卡在两件全天商品上时，程序自己会按配置延后重取，且能收敛。"""
+    import ui.app_window as aw
+    from freshness import ShelfObservation, ShelfWatcher
+
+    def make_snapshot(with_round_item: bool):
+        items = [MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4)),
+                 MerchantItem("棱镜球", 5000, 10, rounds=(1, 2, 3, 4))]
+        if with_round_item:
+            items.append(MerchantItem("血脉药", 100, 1, rounds=(2,)))
+        return MerchantSnapshot(items=items, status="open", round_index=2,
+                                expected_round=2, source_label="测试渠道",
+                                fetched_at=datetime.now())
+
+    state = {"calls": 0, "fresh": False}
+
+    def fake_fetch(_config):
+        state["calls"] += 1
+        return make_snapshot(state["fresh"]), []
+
+    original_fetch = aw.fetch_snapshot
+    aw.fetch_snapshot = fake_fetch
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        config = Config()
+        config.notify_enabled = False
+        config.verify_egress = False
+        config.recheck_delay_seconds = 0.4      # 生产默认 300 秒，测试压到即时
+        config.recheck_max_attempts = 2
+        app = aw.MerchantApp(root, config)
+        # 清掉上一轮测试 / 真实使用留下的货架指纹，保证"首次观测"干净
+        app._watcher.forget()
+        app._shelf_state_key = None
+
+        def note_text():
+            label = getattr(app, "_shelf_note", None)
+            try:
+                return label.cget("text") if label is not None and label.winfo_exists() else ""
+            except tk.TclError:
+                return ""
+
+        def pill_text():
+            try:
+                for item in app.pill.find_all():
+                    if app.pill.type(item) == "text":
+                        return app.pill.itemcget(item, "text")
+            except tk.TclError:
+                pass
+            return ""
+
+        seen: list[str] = []
+
+        def pump_until(condition, timeout=20):
+            end = time.time() + timeout
+            while time.time() < end:
+                root.update()
+                time.sleep(0.01)
+                try:
+                    seen.append(app.status_left.cget("text"))
+                except tk.TclError:
+                    pass
+                if condition():
+                    return True
+            return False
+
+        ok = pump_until(lambda: state["calls"] >= 1 and not app._loading)
+        checked_first = ok and not app._round_retry
+        check("首次观测不做判断", checked_first, f"calls={state['calls']} retry={app._round_retry}")
+
+        # 第二次拿到完全相同的两件全天商品：从这里开始程序应自己重取，不用人点
+        app.refresh(reason="手动刷新")
+        ok = pump_until(lambda: state["calls"] >= 3)
+        check("全天货架自动重取", ok, f"calls={state['calls']}")
+        check("重取没有依赖用户操作", app._round_retry >= 1, str(app._round_retry))
+
+        ok2 = pump_until(lambda: pill_text() == "数据滞后")
+        check("重取用尽后标记数据滞后", ok2, f"pill={pill_text()} calls={state['calls']}")
+        check("状态栏说明只剩全天商品",
+              any("全天商品" in t for t in seen), " / ".join(dict.fromkeys(seen[-6:]))[:160])
+        check("货架提示疑似未换货", "全天商品" in note_text(), note_text())
+        calls_after_give_up = state["calls"]
+
+        # 放弃后同一内容不再无限重取
+        pump_until(lambda: False, timeout=1.2)
+        check("放弃后不再空转", state["calls"] == calls_after_give_up,
+              f"{calls_after_give_up} -> {state['calls']}")
+
+        # 上游恢复：出现本轮商品，界面回到正常状态
+        state["fresh"] = True
+        app.refresh(reason="手动刷新")
+        ok3 = pump_until(lambda: app.snapshot is not None and len(app.snapshot.items) == 3
+                         and not app._round_retry)
+        check("新商品出现后恢复", ok3, app._shelf_count.cget("text"))
+        check("恢复后清掉可疑提示", "⚠" not in note_text(), note_text())
+
+        # 货架指纹落盘 → 冷启动也能凭它判断"其实没换货"
+        try:
+            shelf = json.loads(state_path().read_text(encoding="utf-8")).get("shelf")
+        except (OSError, json.JSONDecodeError):
+            shelf = None
+        check("货架指纹已落盘", isinstance(shelf, dict) and bool(shelf.get("content")), str(shelf))
+        cold = ShelfWatcher(delay=300, max_attempts=1)
+        stale_obs = ShelfObservation.of(make_snapshot(False))
+        cold.seed(ShelfObservation.from_dict(stale_obs.to_dict()))
+        check("冷启动凭上次货架即可判定",
+              cold.observe(make_snapshot(False)).should_retry)
+
+        app.quit_app()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+    finally:
+        aw.fetch_snapshot = original_fetch
+
+
+def test_settings_recheck_fields():
+    """设置界面能改重取节奏，非法输入被拦下且不改动配置。"""
+    import tempfile
+    from pathlib import Path
+
+    from cache import IconCache
+    from ui.settings_dialog import SettingsDialog
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "config.json"
+        root = tk.Tk()
+        root.withdraw()
+        config = Config()
+        cache = IconCache(Path(folder), False)
+        original_save = Config.save
+        # 让对话框的"保存"落到临时文件，别动用户真实配置
+        Config.save = lambda self, target=None: original_save(self, path)
+        try:
+            dialog = SettingsDialog(root, config, cache)
+            root.update()
+            check("设置里有重取间隔输入框", hasattr(dialog, "_recheck_delay_var"))
+            check("重取节奏带出当前配置",
+                  dialog._recheck_delay_var.get() == str(config.recheck_delay_seconds)
+                  and dialog._recheck_max_var.get() == str(config.recheck_max_attempts),
+                  f"{dialog._recheck_delay_var.get()}/{dialog._recheck_max_var.get()}")
+
+            # 非法值：拦下并保留对话框
+            dialog._recheck_delay_var.set("5分钟")
+            dialog._save()
+            check("非法间隔被拦下",
+                  bool(dialog.winfo_exists()) and "整数" in dialog._error.cget("text"),
+                  dialog._error.cget("text"))
+
+            dialog._recheck_delay_var.set("600")
+            dialog._recheck_max_var.set("4")
+            dialog._save()
+            saved = Config.load(path)
+            check("重取节奏可保存并生效",
+                  saved.recheck_delay_seconds == 600 and saved.recheck_max_attempts == 4,
+                  f"{saved.recheck_delay_seconds}/{saved.recheck_max_attempts}")
+        finally:
+            Config.save = original_save
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
 
 
 def test_netdirect_proxy_strip():
@@ -1038,6 +1350,8 @@ def _run_all():
                test_notify_fallback_chain, test_monitor_math,
                test_floating_multimonitor, test_logging, test_tk_error_hook,
                test_rounds_parsing, test_round_lag_detection, test_round_retry_flow,
+               test_shelf_freshness_rules, test_all_day_recheck_flow,
+               test_settings_recheck_fields,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
                test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,
                test_main_window_geometry,
