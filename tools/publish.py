@@ -129,8 +129,12 @@ def current_branch() -> str:
 
 
 def collect_changes() -> tuple[list[str], list[str]]:
-    """返回 (可同步, 跳过) 两组相对路径。"""
-    raw = git("status", "--porcelain").stdout.splitlines()
+    """返回 (可同步, 跳过) 两组相对路径。
+
+    `--untracked-files=all` 不能省：默认只报 `?? docs/ci/` 这样的目录，
+    白名单按后缀判断时会把整个新目录当"未知类型"跳过。
+    """
+    raw = git("status", "--porcelain", "--untracked-files=all").stdout.splitlines()
     keep: list[str] = []
     skipped: list[str] = []
     for line in raw:

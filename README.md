@@ -14,7 +14,7 @@
 
 ---
 
-> 想接手开发或让 AI 继续改这个项目？先读 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**：
+> 想接手开发或让 AI 继续改这个项目？先读 **[docs/development.md](docs/development.md)**：
 > 文件职责、数据流、轮次模型、踩过的坑、改动指引都在那一份里。
 
 ## 功能
@@ -87,10 +87,12 @@
 第三层不是没做好，是做不到：包在你电脑上时路由器已经决定了它的去向。实测同一台机器：
 
 ```
-https://myip.ipip.net   → 180.137.128.120（中国 广西 电信）   ← 大陆目标走直连
-https://ipinfo.io       → 208.87.242.163（US, Psychz）        ← 境外目标被塞进节点
-API 的 /cdn-cgi/trace    → ip=208.87.242.163 colo=LAX         ← 即使按真实 IP 直连也一样
+https://myip.ipip.net   → 203.0.113.10（中国大陆，示例地址）    ← 大陆目标走直连
+https://ipinfo.io       → 198.51.100.20（US，示例地址）         ← 境外目标被塞进节点
+API 的 /cdn-cgi/trace    → ip=198.51.100.20 colo=LAX           ← 即使按真实 IP 直连也一样
 ```
+
+> 上面是实测结果的**脱敏版本**：真实出口 IP 属于个人网络信息，这里换成 RFC 5737 文档示例段。
 
 所以真正有效的解法是**让目标落在中国大陆**：Clash 的 `GEOIP,CN,DIRECT` 会放行。
 社区镜像托管在 Cloudflare（境外），必然被转发；要满足"接口在大陆"，就得自建一个境内反代——
@@ -158,7 +160,7 @@ API 的 /cdn-cgi/trace    → ip=208.87.242.163 colo=LAX         ← 即使按�
 ### 方式二：源码运行
 
 ```bat
-run.bat
+scripts/run.bat
 :: 或
 python main.py
 ```
@@ -172,7 +174,7 @@ pip install pillow
 ### 方式三：自己打包
 
 ```bat
-build_exe.bat
+scripts/build.bat
 ```
 
 脚本会自动创建 `.buildenv` 虚拟环境、安装 PyInstaller、生成图标、按 `app.spec` 打包，产物在 `dist\远行商人助手.exe`。
@@ -263,41 +265,59 @@ exe 与源码运行**共用同一份配置**。
 
 ```
 roco-merchant/
-├── main.py                 # 入口：版本检查、DPI、单实例、协议参数、日志初始化
-├── run.bat                 # 源码启动
-├── build_exe.bat           # 一键打包
-├── app.spec                # PyInstaller 配置（单文件 / 无控制台 / 图标）
-├── version_info.txt        # exe 文件版本信息
-├── config.py               # 配置读写、渠道表、缓存/日志目录解析、资源路径
-├── providers.py            # 数据渠道与自动降级、字段自适应映射
-├── models.py               # MerchantItem / MerchantSnapshot
-├── numerals.py             # 阿拉伯数字 → 中文读法
-├── rarity.py               # 珍惜度判定规则
-├── cache.py                # 图标磁盘缓存、异步加载、目录迁移
-├── scheduler.py            # 定时调度与倒计时
-├── monitors.py             # 多显示器边界（EnumDisplayMonitors）
-├── tray.py                 # 系统托盘（Shell_NotifyIcon，独立线程消息循环）
-├── autostart.py            # 开机自启（HKCU Run 键）
-├── single_instance.py      # 单实例互斥与唤醒
-├── notifier.py             # 通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
-├── notifier_native.py      # WinRT Toast、AppUserModelID、rocomesh:// 协议注册
-├── applog.py               # 日志与异常钩子
-├── freshness.py            # 货架新鲜度判定：轮次落后 / 只剩全天商品 / 本轮商品消失
-├── selftest.py             # 自测（233 项）
-├── tools/make_icon.py      # 纯标准库生成 assets/app.ico
-├── tools/release.py        # 发布：上传 exe 到 Release + 归档旧版
-├── tools/publish.py        # 改动同步：自测门禁 + 白名单提交 + 推送
-├── sync.bat                # 一键同步到 GitHub（自测 → 提交 → 推送）
-├── .github/workflows/release.yml  # CI：推 tag 自动打包发布
-├── assets/app.ico          # 应用图标（构建 exe 用）
-├── dist/                   # 本地打包产物（.gitignore，不入库）
-└── ui/
-    ├── theme.py            # 配色、字体、圆角绘制
-    ├── widgets.py          # 圆角按钮、珍惜度徽章、商品卡片、滚动容器
-    ├── app_window.py       # 主窗口
-    ├── floating_window.py  # 悬浮窗
-    ├── log_viewer.py       # 日志查看器
-    └── settings_dialog.py  # 设置面板
+├── main.py                     # 入口：版本检查、DPI、单实例、协议参数、日志初始化
+├── app.spec                    # PyInstaller 配置（单文件 / 无控制台 / 图标）
+├── requirements.txt            # 无必装依赖；Pillow 为可选增强
+├── config.py                   # 配置读写、渠道表、缓存/日志目录解析、资源路径
+├── providers.py                # 数据渠道与自动降级、字段自适应映射
+├── models.py                   # MerchantItem / MerchantSnapshot
+├── freshness.py                # 货架新鲜度判定：轮次落后 / 只剩全天商品 / 本轮商品消失
+├── numerals.py                 # 阿拉伯数字 → 中文读法
+├── rarity.py                   # 珍惜度判定规则
+├── cache.py                    # 图标磁盘缓存、异步加载、目录迁移
+├── scheduler.py                # 定时调度与倒计时
+├── monitors.py                 # 多显示器边界（EnumDisplayMonitors）
+├── tray.py                     # 系统托盘（Shell_NotifyIcon，独立线程消息循环）
+├── autostart.py                # 开机自启（HKCU Run 键）
+├── single_instance.py          # 单实例互斥与唤醒
+├── notifier.py                 # 通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
+├── notifier_native.py          # WinRT Toast、AppUserModelID、rocomesh:// 协议注册
+├── applog.py                   # 日志与异常钩子
+├── selftest.py                 # 自测（233 项）
+│
+├── scripts/                    # 所有可双击运行的脚本
+│   ├── run.bat                 #   源码启动
+│   ├── build.bat               #   一键打包 exe
+│   └── sync.bat                #   一键同步到 GitHub（自测 → 提交 → 推送）
+│
+├── packaging/
+│   └── version_info.txt        # exe 文件版本信息（被 app.spec 引用）
+│
+├── tools/                      # 开发期工具（不随 exe 分发）
+│   ├── publish.py              #   改动同步：自测门禁 + 白名单提交 + 推送
+│   ├── release.py              #   发布：上传 exe 到 Release + 归档旧版
+│   ├── build_cn_ranges.py      #   重新生成 data/cn_ipv4.txt
+│   └── make_icon.py            #   纯标准库生成 assets/app.ico
+│
+├── docs/
+│   ├── development.md          # 开发交接：数据流、轮次模型、可配置项、同步流程
+│   ├── cn-mirror.md            # 自建大陆反代（Nginx / 云函数两套方案）
+│   ├── release-notes.md        # 当前版本的发布说明（发布时作为 Release 正文）
+│   └── ci/release.yml          # CI 模板：复制到 .github/workflows/ 后生效
+│
+├── data/cn_ipv4.txt            # 中国大陆 IPv4 段（被打进 exe）
+├── assets/app.ico              # 应用图标
+├── ui/                         # 界面层
+│   ├── theme.py                #   配色、字体、圆角绘制
+│   ├── widgets.py              #   圆角按钮、珍惜度徽章、商品卡片、滚动容器
+│   ├── app_window.py           #   主窗口
+│   ├── floating_window.py      #   悬浮窗
+│   ├── log_viewer.py           #   日志查看器
+│   ├── network_dialog.py       #   网络与出口诊断面板
+│   └── settings_dialog.py      #   设置面板
+│
+├── build/ dist/ .buildenv/     # 构建产物与构建环境（.gitignore，不入库）
+└── LICENSE / README.md
 ```
 
 ---
@@ -324,15 +344,17 @@ python selftest.py
 改完并自测通过后，用一条命令把这次变更同步上去（自测 → 白名单收集 → 提交 → 推送）：
 
 ```bat
-sync.bat                       :: 或 python tools/publish.py
-sync.bat -m "fix(x): 修好了"    :: 指定提交信息
-sync.bat --tag v1.4.3          :: 顺便打标签并推送
-python tools/publish.py --dry-run   :: 只看会提交哪些文件
+:: 在仓库根目录执行（脚本内部会自己回到根）
+scripts\sync.bat                     :: 或 python tools\publish.py
+scripts\sync.bat -m "fix(x): 修好了"  :: 指定提交信息
+scripts\sync.bat --tag v1.5.0        :: 顺便打标签并推送
+python tools\publish.py --dry-run    :: 只看会提交哪些文件
 ```
 
-脚本会跳过 `dist/`、`__pycache__/`、`logs/`、`.github/` 等不该入库的东西（`.github/` 需要额外的
-`workflow` scope，推它会让整次 push 失败）。规则、失败处理与"同步 ≠ 发版"的区别见
-**[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 第 8 章**。
+脚本默认跳过 `dist/`、`build/`、`__pycache__/`、`logs/`、`.github/` 等不该入库的东西；
+CI 工作流以模板形式放在 `docs/ci/release.yml`，需要时复制回 `.github/workflows/`
+（推送 workflow 需要带 `workflow` 权限的 token）。规则、失败处理与"同步 ≠ 发版"的区别见
+**[docs/development.md](docs/development.md) 第 8 章**。
 
 ---
 

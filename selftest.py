@@ -300,8 +300,15 @@ def test_native_notify():
 
 def test_single_instance():
     import time
+    import uuid
 
     import single_instance as si
+
+    # 隔离：真实互斥名可能正被用户运行中的程序占用（那说明单实例生效了，
+    # 不该让自测因此变红）。这里换成一次性名字，只验证机制本身。
+    suffix = ".selftest" + uuid.uuid4().hex[:8]
+    si.MUTEX_NAME = si.MUTEX_NAME + suffix
+    si.EVENT_NAME = si.EVENT_NAME + suffix
 
     first = si.acquire()
     second = si.acquire()
@@ -1168,8 +1175,8 @@ def test_publish_script():
     spec.loader.exec_module(module)
 
     check("源码可同步", module.is_publishable("freshness.py"))
-    check("文档可同步", module.is_publishable("docs/DEVELOPMENT.md"))
-    check("脚本可同步", module.is_publishable("sync.bat"))
+    check("文档可同步", module.is_publishable("docs/development.md"))
+    check("脚本可同步", module.is_publishable("scripts/sync.bat"))
     check("产物不同步", not module.is_publishable("dist/远行商人助手.exe", 1024))
     check("构建目录不同步", not module.is_publishable("build/x.py"))
     check("缓存不同步", not module.is_publishable("__pycache__/config.cpython-313.pyc"))

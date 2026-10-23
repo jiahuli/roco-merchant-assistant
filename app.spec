@@ -2,7 +2,7 @@
 """PyInstaller 打包配置：单文件、无控制台、带图标。
 
 构建：
-    .buildenv\\Scripts\\pyinstaller.exe --noconfirm app.spec
+    scripts\\build.bat              （等价于 .buildenv\\Scripts\\pyinstaller.exe --noconfirm app.spec）
 
 产物：
     dist\\远行商人助手.exe
@@ -58,5 +58,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon="assets/app.ico",
-    version="version_info.txt",
+    version="packaging/version_info.txt",
 )

@@ -2,8 +2,8 @@
 
 只写当前用户注册表，不需要管理员权限，随时可关。
 写入的是"启动命令"而不是快捷方式，因此源码运行与 exe 运行都适用：
-    exe  模式： "D:\\Apps\\远行商人助手.exe" --autostart
-    源码 模式： "C:\\Python314\\pythonw.exe" "D:\\...\\main.py" --autostart
+    exe  模式： "<安装目录>\\远行商人助手.exe" --autostart
+    源码 模式： "<Python 目录>\\pythonw.exe" "<项目目录>\\main.py" --autostart
 """
 from __future__ import annotations
 

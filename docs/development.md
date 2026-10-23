@@ -69,7 +69,39 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 
 ---
 
-## 4. 文件结构与职责（约 40 个受版本控制的文件）
+## 4. 文件结构与职责（约 45 个受版本控制的文件）
+
+### 4.1 目录与命名规范
+
+| 目录 | 放什么 | 不放什么 |
+|---|---|---|
+| 仓库根 | 运行时模块（`*.py`）、`main.py`、`app.spec`、`requirements.txt`、`README.md`、`LICENSE` | 脚本、构建产物、文档正文 |
+| `scripts/` | 双击即可用的 `.bat`；内部一律 `cd /d "%~dp0.."` 回到根再执行 | 业务逻辑 |
+| `packaging/` | 打包期资源：`version_info.txt` | 运行期资源（那些进 `assets/`、`data/`） |
+| `tools/` | 开发期 Python 工具（同步 / 发布 / 生成资源），不随 exe 分发 | 被 `import` 的运行时模块 |
+| `ui/` | 界面层，一个窗口一个模块 | 业务规则 |
+| `data/`、`assets/` | 打包进 exe 的静态数据与图标 | 用户数据（那些在 `%APPDATA%\RocoMerchant\`） |
+| `docs/` | 面向维护者的文档；`docs/ci/` 放 CI 模板 | 代码 |
+
+命名规则：
+
+| 对象 | 规则 | 例子 |
+|---|---|---|
+| Python 模块 / 变量 / 函数 | `snake_case` | `notifier_native.py`、`is_all_day` |
+| 类 | `PascalCase` | `MerchantSnapshot`、`ShelfWatcher` |
+| 脚本（`.bat`） | 全小写、动词优先 | `run.bat`、`build.bat`、`sync.bat` |
+| 文档 | 全小写 `kebab-case` | `development.md`、`cn-mirror.md`、`release-notes.md` |
+| 社区惯例文件 | 保持全大写 | `README.md`、`LICENSE` |
+| 数据 / 资源 | 全小写、语义清晰 | `cn_ipv4.txt`、`app.ico` |
+
+两条刻意的例外（改动收益低于风险，别"顺手整理"）：
+
+- **运行时模块平铺在根目录**，不打包成 `roco/` 包：`main.py` 直接 `import` 它们，
+  `app.spec` 的 `hiddenimports` / `pathex`、`scripts/build.bat`、`selftest.py` 都依赖这个布局，
+  单文件 exe 也不需要包结构。真要做，那是一次全量 import 改造——属于重构，不是整理。
+- **`docs/ci/release.yml` 不放在 `.github/workflows/`**：推送 workflow 需要带 `workflow`
+  权限的 token，缺权限时 push 与 tag 会被一并拒绝（见第 9 章）。模板放 `docs/ci/` 能随仓库分发，
+  启用时再复制回去（`ci/release.yml` 顶部写了命令）。
 
 ### 核心逻辑（项目根目录，按依赖顺序）
 
@@ -114,10 +146,16 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `tools/publish.py` | **改动同步**：自测门禁 → 白名单收集 → 提交 → 推送（可选打 tag），见第 8 章 |
 | `tools/release.py` | 发布：建 Release、上传 exe、改固定名、归档旧版 |
 | `tools/make_icon.py` | 纯标准库生成 `assets/app.ico`（手写 PNG + ICO 封装） |
-| `sync.bat` | `tools/publish.py` 的 Windows 一键入口（自测 → 提交 → 推送） |
+| `scripts/run.bat` | 源码启动入口（在 `scripts/` 下执行，内部先回根目录） |
+| `scripts/build.bat` | 一键打包：建/复用 `.buildenv` → 装 PyInstaller → 生成图标 → 打包 |
+| `scripts/sync.bat` | `tools/publish.py` 的 Windows 一键入口（自测 → 提交 → 推送） |
+| `packaging/version_info.txt` | exe 文件版本资源，被 `app.spec` 的 `version=` 引用；**发版时要与 `APP_VERSION` 同步** |
 | `app.spec` | PyInstaller 配置。**新增数据文件必须加进 `datas`**（如 `data/cn_ipv4.txt`），否则打包后功能静默失效 |
 | `selftest.py` | 233 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
+| `docs/development.md` | 本文档（开发交接、可配置项、同步流程），原 `DEVELOPMENT.md` |
 | `docs/cn-mirror.md` | 自建大陆反代（Nginx / 云函数两套配置） |
+| `docs/release-notes.md` | 当前版本的发布说明，`tools/release.py` 直接拿它当 Release 正文 |
+| `docs/ci/release.yml` | CI 模板（打包 + 发布），启用方式见文件头注释 |
 | `README.md` | 用户视角文档 |
 | `LICENSE` | MIT |
 
@@ -217,10 +255,11 @@ scheduler 到点 / 用户点刷新
 一条命令走完：
 
 ```bat
-sync.bat                                      :: 自测 -> 提交 -> 推送
-sync.bat -m "fix(x): 修好了" --tag v1.4.3      :: 指定提交信息，顺便打标签
-python tools/publish.py --dry-run             :: 只看会提交哪些文件
-python tools/publish.py --push-only           :: 只推送已有提交（网络恢复后用）
+:: 在仓库根目录执行（scripts\sync.bat 内部会自己回到根）
+scripts\sync.bat                                    :: 自测 -> 提交 -> 推送
+scripts\sync.bat -m "fix(x): 修好了" --tag v1.5.0    :: 指定提交信息，顺便打标签
+python tools\publish.py --dry-run                   :: 只看会提交哪些文件
+python tools\publish.py --push-only                 :: 只推送已有提交（网络恢复后用）
 ```
 
 > 打标签的时机：`--tag` 打在**当次提交**上。所以请把"本次改动的最后一个提交"和 `--tag`
@@ -239,18 +278,18 @@ python tools/publish.py --push-only           :: 只推送已有提交（网络�
 
 | 规则 | 覆盖 | 原因 |
 |---|---|---|
-| `EXCLUDE_PREFIXES` | `dist/` `build/` `__pycache__/` `logs/` `.workbuddy/` `.github/` | 产物、缓存、日志不该入库；`.github/workflows` 需要额外 `workflow` scope，推它会让整次 push（含 tag）失败 |
+| `EXCLUDE_PREFIXES` | `dist/` `build/` `__pycache__/` `logs/` `.workbuddy/` `.github/` | 产物、缓存、日志不该入库；`.github/workflows` 需要额外 `workflow` scope，推它会让整次 push（含 tag）失败（CI 模板因此放 `docs/ci/`） |
 | `EXCLUDE_SUFFIXES` | `.pyc` `.exe` `.zip` `.log` `.tmp` `.bak` | 同上 |
 | `MAX_BYTES` | > 20MB 的文件 | 基本是误入的二进制 |
 | `INCLUDE_SUFFIXES` | 源码 / 文档 / 构建脚本 / 图标等 | 白名单思路：不认识的不推，避免"顺手带上不该带的东西" |
 
-两点说明：
+三点说明：
 
 - **为什么不 `git add -A`**：见上表第 1、2 行，`.github/` 会让 push 连带 tag 一起被拒（第 9 章「踩过的坑」有记录）。
 - **同步 ≠ 发版**：本流程只同步源码与文档，不构建 exe。发版仍需
-  `build_exe.bat` → `tools/release.py` → 打 tag，见第 10 章。
+  `scripts/build.bat` → `tools/release.py` → 打 tag，见第 10 章。
 - **为什么不做成 git hook**：`.git/hooks/` 不进版本库，换台机器就失效；而"每次更新都同步"
-  是跟着仓库走的约定。所以入口放在仓库内（`sync.bat` / `tools/publish.py`），并把
+  是跟着仓库走的约定。所以入口放在仓库内（`scripts/sync.bat` / `tools/publish.py`），并把
   "自测通过 + 已推送"写成完成的定义。想要强制拦截的话，本机可
   `git config core.hooksPath .githooks` 自己挂 pre-push 钩子——那属于个人配置，不入库。
 
@@ -260,7 +299,7 @@ python tools/publish.py --push-only           :: 只推送已有提交（网络�
 
 | 坑 | 现象 | 正解 |
 |---|---|---|
-| **git 提交含 `.github/workflows`** | token 缺 `workflow` scope，push 与 **tag 都被连带拒绝** | 不要把 workflow 放进 main 的历史；工作区保留未跟踪，或先在网页建文件 |
+| **git 提交含 `.github/workflows`** | token 缺 `workflow` scope，push 与 **tag 都被连带拒绝** | 模板放 `docs/ci/release.yml` 随仓库分发；需要 CI 时复制到 `.github/workflows/` 并用带 `workflow` 权限的 token 推送 |
 | **`gh api check=False` 的 404** | stdout 是 `{"message":"Not Found"}`，被当成"已存在" | 判断 `"id" in data` 才算存在 |
 | **PyInstaller 漏 datas** | 打包后大陆判定恒为 False | `app.spec` 的 `datas` 加 `("data/cn_ipv4.txt","data")`，并用启动日志核验条数 |
 | **`-WindowStyle Hidden` + `CREATE_NO_WINDOW`** | PowerShell 子进程稳定挂死 20s | 两者都不要加，改用 `-EncodedCommand` |
@@ -275,17 +314,31 @@ python tools/publish.py --push-only           :: 只推送已有提交（网络�
 
 ## 10. 开发命令
 
-```bash
-python main.py                 # 跑源码（需 Python 3.9+ 且含 tkinter）
-python selftest.py             # 233 项自测，应输出"失败 0 项"
-python -m compileall -q .      # 语法检查
-sync.bat                       # 自测 -> 提交 -> 推送 GitHub（见第 8 章）
-build_exe.bat                  # 装 PyInstaller 并打包到 dist\
-python tools/release.py --asset "dist/远行商人助手.exe" --notes-file docs/release-notes.md
+```bat
+:: 运行时（根目录）
+python main.py                              :: 跑源码（需 Python 3.9+ 且含 tkinter）
+python selftest.py                          :: 233 项自测，应输出"失败 0 项"
+python -m compileall -q .                   :: 语法检查
+
+:: 脚本（scripts/ 下，双击或命令行均可）
+scripts\run.bat                             :: 源码启动
+scripts\build.bat                           :: 建/复用 .buildenv → 装 PyInstaller → 打包到 dist\
+scripts\sync.bat                            :: 自测 → 提交 → 推送 GitHub（见第 8 章）
+
+:: 发布
+python tools\release.py --asset "dist\远行商人助手.exe" --notes-file docs\release-notes.md
 ```
 
-发版顺序：改 `config.APP_VERSION` 与 `version_info.txt` → 提交推送 → `git tag -a vX.Y.Z` 推送 →
-`tools/release.py`（会把新版资产命名成 `RocoMerchantAssistant.exe`，旧版归档为 `-v{tag}.exe`）。
+发版顺序：
+
+1. 改 `config.APP_VERSION` 与 `packaging/version_info.txt`（两者必须一致）；
+2. 更新 `docs/release-notes.md`（会成为 Release 正文）；
+3. `scripts\sync.bat -m "..." --tag vX.Y.Z`（自测 + 提交 + 推送 + 打标签一次完成）；
+4. `scripts\build.bat` 打包，再 `python tools\release.py` 上传资产
+   （新版命名 `RocoMerchantAssistant.exe`，旧版归档为 `-v{tag}.exe`）。
+
+> `tools/publish.py` 的自测门禁会自动挑带 tkinter 的解释器；`scripts/build.bat` 用的是
+> `.buildenv` 里的独立环境，两者互不影响。
 
 ---
 
