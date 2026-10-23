@@ -246,6 +246,10 @@ python tools/publish.py --push-only           :: 只推送已有提交（网络�
 - **为什么不 `git add -A`**：见上表第 1、2 行，`.github/` 会让 push 连带 tag 一起被拒（第 9 章「踩过的坑」有记录）。
 - **同步 ≠ 发版**：本流程只同步源码与文档，不构建 exe。发版仍需
   `build_exe.bat` → `tools/release.py` → 打 tag，见第 10 章。
+- **为什么不做成 git hook**：`.git/hooks/` 不进版本库，换台机器就失效；而"每次更新都同步"
+  是跟着仓库走的约定。所以入口放在仓库内（`sync.bat` / `tools/publish.py`），并把
+  "自测通过 + 已推送"写成完成的定义。想要强制拦截的话，本机可
+  `git config core.hooksPath .githooks` 自己挂 pre-push 钩子——那属于个人配置，不入库。
 
 ---
 
