@@ -33,6 +33,7 @@ _PRICE_KEYS = ("price", "raw_price", "rawPrice", "cost", "goods_price", "sell_pr
 _LIMIT_KEYS = ("limit", "buy_limit", "buyLimit", "quota", "num", "count", "stock", "max_buy")
 _IMAGE_KEYS = ("image", "icon", "img", "pic", "image_url", "imageUrl", "icon_url", "iconUrl", "picture")
 _CATEGORY_KEYS = ("category", "type", "kind", "classify", "goods_type")
+_ROUNDS_KEYS = ("rounds", "sale_rounds", "available_rounds", "round_list", "sell_rounds")
 _DESC_KEYS = ("description", "desc", "intro", "detail", "note", "remark")
 _ITEM_LIST_PATHS = (
     "items", "goods_list", "goodsList", "data.items", "data.goods_list",
@@ -102,6 +103,48 @@ def _find_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _to_rounds(value: Any) -> tuple[int, ...]:
+    """把 rounds 字段清洗成升序元组；无法识别返回空元组（视为未知）。"""
+    if isinstance(value, (list, tuple)):
+        result = []
+        for raw in value:
+            number = _to_int(raw)
+            if number and 1 <= number <= 4:
+                result.append(number)
+        return tuple(sorted(set(result)))
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ()
+        try:
+            return _to_rounds(json.loads(text))
+        except (json.JSONDecodeError, TypeError):
+            parts = [part for part in text.replace("，", ",").split(",") if part.strip()]
+            return _to_rounds(parts)
+    return ()
+
+
+def filter_by_round(
+    items: list[MerchantItem], round_index: int | None
+) -> tuple[list[MerchantItem], list[MerchantItem]]:
+    """剔除明确不属于本轮的条目，返回 (保留, 剔除)。
+
+    正常情况下接口只返回本轮货架，这里是防御：一旦上游把旧轮次商品
+    和全天商品混在一起返回，界面上就会出现"早该下架的还在"。
+    轮次未知（rounds 为空）的条目一律保留，宁多不少。
+    """
+    if not round_index:
+        return items, []
+    kept: list[MerchantItem] = []
+    dropped: list[MerchantItem] = []
+    for item in items:
+        if item.rounds and round_index not in item.rounds:
+            dropped.append(item)
+        else:
+            kept.append(item)
+    return kept, dropped
+
+
 def build_items(raw_items: Iterable[dict[str, Any]]) -> list[MerchantItem]:
     items: list[MerchantItem] = []
     seen: set[str] = set()
@@ -118,6 +161,7 @@ def build_items(raw_items: Iterable[dict[str, Any]]) -> list[MerchantItem]:
         image = _first_value(raw, _IMAGE_KEYS) or ""
         category = str(_first_value(raw, _CATEGORY_KEYS) or "")
         desc = str(_first_value(raw, _DESC_KEYS) or "")
+        rounds = _to_rounds(_first_value(raw, _ROUNDS_KEYS))
         items.append(
             MerchantItem(
                 name=name,
@@ -126,6 +170,7 @@ def build_items(raw_items: Iterable[dict[str, Any]]) -> list[MerchantItem]:
                 icon_url=str(image),
                 category=category,
                 description=desc,
+                rounds=rounds,
                 rarity=infer_rarity(name, price, category),
             )
         )
@@ -279,22 +324,30 @@ class RkwProvider(BaseProvider):
         if not isinstance(payload, dict):
             raise ProviderError("返回结构异常")
 
-        items = build_items(_find_items(payload))
+        moment = now_cn()
+        # 接口自报的轮次优先；它落后于本地时间时说明上游还没换货
+        round_index = _to_int(payload.get("round") or payload.get("current_round")) \
+            or round_index_at(moment)
+        expected_round = _to_int(payload.get("expectedRound") or payload.get("expected_round")) \
+            or round_index_at(moment)
+
+        items, dropped = filter_by_round(build_items(_find_items(payload)), round_index)
+
         status_raw = str(payload.get("status") or "").lower()
         if status_raw in ("open", "closed"):
             status = status_raw
         else:
-            status = STATUS_OPEN if is_open_at(now_cn()) else STATUS_CLOSED
+            status = STATUS_OPEN if is_open_at(moment) else STATUS_CLOSED
 
         next_refresh = _parse_dt(payload.get("nextRefreshBeijing") or payload.get("next_refresh_time"))
         started = _parse_dt(payload.get("startedAtBeijing") or payload.get("refresh_time"))
-        moment = now_cn()
         return MerchantSnapshot(
             items=items,
             source_id=self.id,
             source_label=self.label,
             status=status,
-            round_index=_to_int(payload.get("round") or payload.get("current_round")) or round_index_at(moment),
+            expected_round=expected_round,
+            round_index=round_index,
             started_at=started.strftime("%Y-%m-%d %H:%M") if started else None,
             next_refresh=(next_refresh or next_refresh_at(moment)).strftime("%Y-%m-%d %H:%M"),
             position=payload.get("position") or payload.get("merchant_pos"),
@@ -420,13 +473,21 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
         _first_value(meta, ("startedAtBeijing", "refresh_time", "started_at", "refreshTime"))
     )
 
+    round_index = _to_int(
+        _first_value(meta, ("round", "current_round", "roundIndex"))
+    ) or round_index_at(moment)
+    expected_round = _to_int(
+        _first_value(meta, ("expectedRound", "expected_round"))
+    ) or round_index_at(moment)
+    items, _dropped = filter_by_round(build_items(_find_items(payload)), round_index)
+
     return MerchantSnapshot(
-        items=build_items(_find_items(payload)),
+        items=items,
         source_id=source_id,
         source_label=label,
         status=status,
-        round_index=_to_int(_first_value(meta, ("round", "current_round", "roundIndex")))
-        or round_index_at(moment),
+        expected_round=expected_round,
+        round_index=round_index,
         started_at=started.strftime("%Y-%m-%d %H:%M") if started else None,
         next_refresh=(next_refresh or next_refresh_at(moment)).strftime("%Y-%m-%d %H:%M"),
         position=_first_value(meta, ("position", "merchant_pos", "location")),

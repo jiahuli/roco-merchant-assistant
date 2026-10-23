@@ -118,12 +118,20 @@ class SettingsDialog(tk.Toplevel):
                 style="subtle", width=len(name) * 12 + 26, height=28, font_size=8,
             ).pack(side="left", padx=(0, 6))
 
+        self._recheck_var = tk.BooleanVar(value=self._draft.auto_recheck_after_refresh)
+        tk.Checkbutton(
+            holder, text="换货后自动校验（接口还没刷新时持续重试）", variable=self._recheck_var,
+            bg=SURFACE, fg=TEXT_DIM, activebackground=SURFACE, activeforeground=TEXT,
+            selectcolor=SURFACE_2, font=ui_font(9), bd=0, highlightthickness=0,
+        ).pack(anchor="w", pady=(10, 0))
+
         tk.Label(
             holder,
-            text="提示：商人在 08:00 / 12:00 / 16:00 / 20:00 换货，默认取整点后 5 分钟查询，"
-                 "避免接口还没刷新。",
+            text="提示：商人在 08:00 / 12:00 / 16:00 / 20:00 换货，默认取整点后 5 分钟查询。"
+                 "接口有缓存，刚换货时可能仍返回上一轮的货架——开启上面的选项后，"
+                 "程序会按 30/60/120/180/240 秒重试，拿到新一轮数据才停下。",
             bg=SURFACE, fg=MUTED, font=ui_font(8), justify="left", wraplength=580,
-        ).pack(fill="x", pady=(10, 0))
+        ).pack(fill="x", pady=(6, 0))
 
     # -------------------------------------------------------------- 数据渠道
     def _build_provider(self, master: tk.Misc) -> None:
@@ -548,6 +556,7 @@ class SettingsDialog(tk.Toplevel):
         draft.query_times = times
         draft.provider = self._current_pid
         draft.auto_fallback = bool(self._fallback_var.get())
+        draft.auto_recheck_after_refresh = bool(self._recheck_var.get())
         draft.force_direct = bool(self._direct_var.get())
         draft.doh_enabled = bool(self._doh_var.get())
         draft.prefer_cn_region = bool(self._cn_var.get())

@@ -184,6 +184,14 @@ class ItemCard(tk.Frame):
 
         head = tk.Frame(body, bg=SURFACE)
         head.pack(fill="x")
+
+        # 全天在售角标：解释"为什么换货后这件还在"，避免误认为没刷新
+        if item.is_all_day:
+            tk.Label(
+                head, text="全天", bg=mix(ACCENT, SURFACE, 0.82), fg=ACCENT,
+                font=ui_font(8, "bold"), padx=6, pady=1,
+            ).pack(side="right", padx=(0, 6))
+
         RarityBadge(head, item, bg=SURFACE).pack(side="right")
         self.name_label = tk.Label(
             head, text=item.name, bg=SURFACE, fg=TEXT, font=ui_font(11, "bold"),

@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -170,6 +170,9 @@ class Config:
     prefer_cn_region: bool = True       # 优先选择中国大陆渠道
     verify_egress: bool = True          # 每次查询后校验真实出口（多一次轻量请求）
 
+    # 换货校验：接口缓存可能落后于本地时间，查到旧轮次时自动重试
+    auto_recheck_after_refresh: bool = True
+
     # 定时查询（24 小时制 HH:MM）
     query_times: list[str] = field(default_factory=lambda: list(QUERY_TIME_PRESETS["默认（刷新后 5 分钟）"]))
 
@@ -250,6 +253,7 @@ class Config:
         for key in ("auto_fallback", "notify_enabled", "notify_native", "notify_toast",
                     "notify_sound", "notify_flash", "icon_cache_enabled", "autostart", "close_to_tray", "tray_enabled",
                     "force_direct", "doh_enabled", "prefer_cn_region", "verify_egress",
+                    "auto_recheck_after_refresh",
                     "floating_enabled", "floating_topmost", "floating_show_icons",
                     "show_closed_message"):
             setattr(cfg, key, bool(getattr(cfg, key)))

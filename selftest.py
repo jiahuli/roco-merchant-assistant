@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -571,6 +572,155 @@ def test_tk_error_hook():
     root.destroy()
 
 
+def test_rounds_parsing():
+    """rounds 字段：解析、全天判定、按轮次过滤。"""
+    from models import MerchantItem, TOTAL_ROUNDS
+    from providers import _to_rounds, filter_by_round
+
+    check("列表解析", _to_rounds([1, 2, 3, 4]) == (1, 2, 3, 4))
+    check("去重排序", _to_rounds([3, 1, 1]) == (1, 3))
+    check("字符串解析", _to_rounds("1,2,4") == (1, 2, 4))
+    check("JSON 字符串解析", _to_rounds("[2,3]") == (2, 3))
+    check("越界值被丢弃", _to_rounds([0, 5, 2]) == (2,))
+    check("空值安全", _to_rounds(None) == () and _to_rounds("") == ())
+
+    all_day = MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
+    one_round = MerchantItem("血脉药", 5000, 10, rounds=(2,))
+    unknown = MerchantItem("神秘商品", 100, 1)
+    check("四轮商品算全天", all_day.is_all_day and len(all_day.rounds) == TOTAL_ROUNDS)
+    check("单轮商品不算全天", not one_round.is_all_day)
+    check("无 rounds 不算全天", not unknown.is_all_day)
+    check("全天文案", all_day.rounds_text == "全天在售", all_day.rounds_text)
+    check("单轮文案", one_round.rounds_text == "第 2 轮", one_round.rounds_text)
+
+    kept, dropped = filter_by_round([all_day, one_round, unknown], 1)
+    names = [i.name for i in kept]
+    check("过滤掉不属于本轮的", [i.name for i in dropped] == ["血脉药"], str([i.name for i in dropped]))
+    check("全天商品保留", "条件球" in names, str(names))
+    check("轮次未知的保留", "神秘商品" in names, str(names))
+
+    kept, dropped = filter_by_round([all_day, one_round], 2)
+    check("第 2 轮保留血脉药", "血脉药" in [i.name for i in kept] and not dropped)
+
+
+def test_round_lag_detection():
+    """换货滞后判定：接口轮次落后本地时即为滞后。"""
+    from models import MerchantItem, MerchantSnapshot
+
+    item = MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
+    lagging = MerchantSnapshot(items=[item], status="open", round_index=1, expected_round=2)
+    synced = MerchantSnapshot(items=[item], status="open", round_index=2, expected_round=2)
+    unknown = MerchantSnapshot(items=[item], status="open", round_index=None, expected_round=2)
+
+    check("接口落后判定为滞后", lagging.is_round_lagging)
+    check("轮次一致不算滞后", not synced.is_round_lagging)
+    check("轮次未知不误判", not unknown.is_round_lagging)
+    check("全天件数统计", lagging.all_day_count == 1, str(lagging.all_day_count))
+
+    # 真实结构：把接口返回体喂给解析器，验证轮次与过滤同时生效
+    from providers import snapshot_from_payload
+
+    payload = {
+        "status": "open",
+        "round": 1,
+        "expectedRound": 2,
+        "items": [
+            {"name": "条件球", "price": 3000, "limit": 100, "rounds": [1, 2, 3, 4]},
+            {"name": "旧轮商品", "price": 100, "limit": 1, "rounds": [1]},
+        ],
+    }
+    snap = snapshot_from_payload(payload, "test", "测试渠道")
+    names = [i.name for i in snap.items]
+    check("解析出 expectedRound", snap.expected_round == 2, str(snap.expected_round))
+    check("解析出当前轮次", snap.round_index == 1, str(snap.round_index))
+    check("滞后被识别", snap.is_round_lagging)
+    check("全天商品保留在结果里", "条件球" in names, str(names))
+
+
+def test_round_retry_flow():
+    """端到端：接口一直返回旧轮次时会自动重试；换到新轮次后停止。"""
+    import time
+
+    import ui.app_window as aw
+    from models import MerchantItem, MerchantSnapshot
+
+    def make_snapshot(round_no: int):
+        return MerchantSnapshot(
+            items=[MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))],
+            status="open",
+            round_index=round_no,
+            expected_round=2,
+            source_label="测试渠道",
+            fetched_at=datetime.now(),
+        )
+
+    state = {"calls": 0, "current": 1}
+
+    def fake_fetch(_config):
+        state["calls"] += 1
+        return make_snapshot(state["current"]), []
+
+    original_fetch = aw.fetch_snapshot
+    original_delays = aw.MerchantApp.ROUND_RETRY_DELAYS
+    # 把重试间隔压到 0.05 秒，测试不必真等 30 秒
+    aw.fetch_snapshot = fake_fetch
+    aw.MerchantApp.ROUND_RETRY_DELAYS = (0.4, 0.4)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        config = Config()
+        config.notify_enabled = False
+        config.verify_egress = False
+        app = aw.MerchantApp(root, config)
+
+        def note_text():
+            label = getattr(app, "_shelf_note", None)
+            return label.cget("text") if label is not None else ""
+
+        seen_status: list[str] = []
+
+        def pump_until(condition, timeout=20):
+            end = time.time() + timeout
+            while time.time() < end:
+                root.update()
+                time.sleep(0.01)
+                try:
+                    seen_status.append(app.status_left.cget("text"))
+                except tk.TclError:
+                    pass
+                if condition():
+                    return True
+            return False
+
+        ok = pump_until(lambda: state["calls"] >= 2)
+        check("滞后时自动重试", ok, f"calls={state['calls']}")
+        check("重试计数递增", app._round_retry >= 1, str(app._round_retry))
+        # 状态栏在两次重试之间会短暂显示"还在第 1 轮，N 秒后重试"，逐步采样才抓得到
+        lag_status = [t for t in seen_status if "第 1 轮" in t and "重试" in t]
+        check("状态栏提示换货校验", bool(lag_status),
+              " / ".join(dict.fromkeys(seen_status[-6:]))[:160])
+        check("货架提示滞后", "应为第 2 轮" in note_text(), note_text())
+
+        # 模拟上游完成换货
+        state["current"] = 2
+        app.refresh(reason="手动刷新")
+        ok2 = pump_until(lambda: not app._round_retry and state["calls"] >= 3)
+        check("换货后停止重试", ok2, f"retry={app._round_retry} calls={state['calls']}")
+        check("换货后不再提示滞后", "应为" not in note_text(), note_text())
+        check("换货后倒计时恢复",
+              "全天在售" in app._shelf_count.cget("text"),
+              app._shelf_count.cget("text"))
+
+        app.quit_app()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+    finally:
+        aw.fetch_snapshot = original_fetch
+        aw.MerchantApp.ROUND_RETRY_DELAYS = original_delays
+
+
 def test_netdirect_proxy_strip():
     """直连层第一道：代理环境变量被剥离，urllib 不再报告系统代理。"""
     import os
@@ -887,6 +1037,7 @@ def _run_all():
                test_single_instance, test_floating_window, test_config_roundtrip,
                test_notify_fallback_chain, test_monitor_math,
                test_floating_multimonitor, test_logging, test_tk_error_hook,
+               test_rounds_parsing, test_round_lag_detection, test_round_retry_flow,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
                test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,
                test_main_window_geometry,

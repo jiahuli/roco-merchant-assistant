@@ -28,6 +28,9 @@ from ui.widgets import ItemCard, PillButton, ScrollFrame, StatBlock, StatusPill
 
 
 class MerchantApp:
+    # 换货后接口缓存可能还没跟上：依次等待这些秒数重试，合计约 10 分钟
+    ROUND_RETRY_DELAYS = (30, 60, 120, 180, 240)
+
     def __init__(self, root: tk.Tk, config: Config) -> None:
         self.root = root
         self.config = config
@@ -43,6 +46,9 @@ class MerchantApp:
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="fetch")
         self._results: queue.Queue = queue.Queue()
         self._show_requests: queue.Queue = queue.Queue()
+        self._round_retry = 0
+        self._round_retry_job: str | None = None
+        self._pump_job: str | None = None
         self._tray_commands: queue.Queue = queue.Queue()
         self.tray: tray_module.TrayIcon | None = None
         self._tray_hint_shown = False
@@ -100,7 +106,7 @@ class MerchantApp:
                 break
             self._handle_tray_command(command)
         if not getattr(self, "_closing", False):
-            self.root.after(80, self._pump_results)
+            self._pump_job = self.root.after(80, self._pump_results)
 
     # ------------------------------------------------------------------ 窗口
     def _setup_window(self) -> None:
@@ -397,6 +403,9 @@ class MerchantApp:
     def refresh(self, reason: str = "手动刷新") -> None:
         if self._loading:
             return
+        if reason != "换货校验重试":
+            # 用户主动刷新 / 定时查询：重试计数归零，重新给足机会
+            self._round_retry = 0
         self._loading = True
         self.refresh_btn.set_enabled(False)
         self.refresh_btn.set_text("查询中…")
@@ -423,8 +432,12 @@ class MerchantApp:
         self._error_text = ""
         route = snapshot.route or {}
         egress = route.get("egress") or {}
-        applog.info("查询成功 | %s | 第%s轮 | %s 件 | 更新于 %s | 目标 %s(%s) 出口 %s %s",
-                    snapshot.source_label, snapshot.round_index, len(snapshot.items),
+        lag = ""
+        if snapshot.is_round_lagging:
+            lag = f"·滞后(应第{snapshot.expected_round}轮)"
+        applog.info("查询成功 | %s | 第%s轮%s | %s 件(全天 %s) | 更新于 %s | 目标 %s(%s) 出口 %s %s",
+                    snapshot.source_label, snapshot.round_index, lag,
+                    len(snapshot.items), snapshot.all_day_count,
                     snapshot.fetched_at.strftime("%H:%M:%S"),
                     route.get("ip", "?"),
                     "大陆" if route.get("is_cn") else "境外",
@@ -445,7 +458,61 @@ class MerchantApp:
                      f"{snapshot.fetched_at.strftime('%H:%M:%S')} 更新",
                 fg=MUTED,
             )
+        self._check_round_lag(snapshot, reason)
         self._maybe_notify(snapshot)
+
+    def _cancel_round_retry(self) -> None:
+        if self._round_retry_job is not None:
+            try:
+                self.root.after_cancel(self._round_retry_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._round_retry_job = None
+
+    def _check_round_lag(self, snapshot: MerchantSnapshot, reason: str) -> None:
+        """换货校验：接口还在给上一轮的货架时，短间隔重试直到换货。
+
+        这是"八点换货后新商品不出现、未刷新的全天商品一直在"的根因：
+        接口有缓存，换货瞬间查到的还是旧轮次；原实现只在固定时间点查一次，
+        查到旧数据也照样渲染，之后要等到下一个整点才再查。
+        """
+        self._cancel_round_retry()
+
+        if not self.config.auto_recheck_after_refresh:
+            return
+        if snapshot.status != "open" or not snapshot.is_round_lagging:
+            if self._round_retry:
+                applog.info("接口已换到第 %s 轮，停止重试（共试 %s 次）",
+                            snapshot.round_index, self._round_retry)
+                self._round_retry = 0
+            return
+
+        if self._round_retry >= len(self.ROUND_RETRY_DELAYS):
+            applog.warning(
+                "换货校验放弃 | 接口仍为第 %s 轮（本地应为第 %s 轮），已重试 %s 次；"
+                "界面展示的是接口给的数据，可稍后手动刷新",
+                snapshot.round_index, snapshot.expected_round, self._round_retry)
+            self.status_left.configure(
+                text=f"{reason} · 接口尚未换货（仍为第 {snapshot.round_index} 轮），"
+                     f"已重试 {self._round_retry} 次，稍后可手动刷新",
+                fg=WARNING,
+            )
+            self.pill.set_state("数据滞后", WARNING)
+            return
+
+        delay = self.ROUND_RETRY_DELAYS[self._round_retry]
+        self._round_retry += 1
+        applog.info("换货校验 | 接口为第 %s 轮 / 本地应为第 %s 轮，%s 秒后第 %s 次重试",
+                    snapshot.round_index, snapshot.expected_round, delay, self._round_retry)
+        self.status_left.configure(
+            text=f"{reason} · 接口还在第 {snapshot.round_index} 轮，"
+                 f"{delay} 秒后重试（{self._round_retry}/{len(self.ROUND_RETRY_DELAYS)}）",
+            fg=WARNING,
+        )
+        self.pill.set_state("换货校验中", WARNING)
+        self._round_retry_job = self.root.after(
+            int(delay * 1000), lambda: self.refresh(reason="换货校验重试")
+        )
 
     def _on_ui_error(self, name: str, message: str) -> None:
         """界面回调里抛出的异常：状态栏提示 + 首次弹窗，堆栈已由日志钩子记录。"""
@@ -554,9 +621,20 @@ class MerchantApp:
         shelf_text = f"共 {len(snapshot.items)} 件"
         if special:
             shelf_text += f" · {label}及以上 {special} 件"
+        all_day = snapshot.all_day_count
+        if all_day:
+            shelf_text += f" · 其中 {all_day} 件全天在售"
         self._shelf_count.configure(text=shelf_text)
-        note = f"下一轮 {self._countdown_target.strftime('%H:%M')} 换货" if self._countdown_target else ""
-        self._shelf_note.configure(text=note)
+
+        if snapshot.is_round_lagging:
+            self._shelf_note.configure(
+                text=f"⚠ 接口仍是第 {snapshot.round_index} 轮（应为第 {snapshot.expected_round} 轮），正在重试",
+                fg=WARNING,
+            )
+        else:
+            note = (f"下一轮 {self._countdown_target.strftime('%H:%M')} 换货"
+                    if self._countdown_target else "")
+            self._shelf_note.configure(text=note, fg=MUTED)
 
         for index, item in enumerate(snapshot.items):
             card = ItemCard(grid, item, self.loader, index)
@@ -972,6 +1050,13 @@ class MerchantApp:
         if self._quitting:
             return
         applog.info("程序退出")
+        self._cancel_round_retry()
+        if self._pump_job is not None:
+            try:
+                self.root.after_cancel(self._pump_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._pump_job = None
         self._quitting = True
         self._closing = True
         try:
