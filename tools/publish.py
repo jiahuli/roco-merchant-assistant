@@ -180,11 +180,24 @@ def pick_test_python() -> str:
     return ""
 
 
+def python_version(python: str) -> str:
+    try:
+        result = subprocess.run(
+            [python, "-c", "import sys; print(sys.version.split()[0])"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "未知版本"
+    return (result.stdout or "").strip() or "未知版本"
+
+
 def run_selftest(python: str) -> bool:
-    print(f"→ 跑自测（{Path(python).name} selftest.py）…")
+    # 解释器路径也打出来：排查"为什么用的是另一个 Python"时不用猜
+    print(f"→ 跑自测（Python {python_version(python)} @ {python}）…")
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     result = subprocess.run(
         [python, "selftest.py"], cwd=str(ROOT), capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
+        text=True, encoding="utf-8", errors="replace", env=env,
     )
     tail = [line for line in (result.stdout or "").splitlines() if line.strip()][-3:]
     for line in tail:

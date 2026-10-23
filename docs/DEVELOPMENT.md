@@ -227,7 +227,7 @@ python tools/publish.py --push-only           :: 只推送已有提交（网络�
 
 | 步骤 | 做什么 | 失败怎么办 |
 |---|---|---|
-| 1. 自测 | 自动挑一个带 `tkinter` 的解释器跑 `selftest.py`，必须"失败 0 项" | 修好再跑；确需跳过用 `--skip-tests`（会在输出里留警告） |
+| 1. 自测 | 自动挑一个带 `tkinter` 的解释器跑 `selftest.py`（会打印版本与路径），必须"失败 0 项" | 修好再跑；确需跳过用 `--skip-tests`（会在输出里留警告） |
 | 2. 收集 | 解析 `git status --porcelain`，按白名单筛出可同步文件并打印 | `--dry-run` 先看一眼，发现误入的产物就补进排除表 |
 | 3. 提交 | `git add` 白名单文件 → `git commit -m`（缺省自动生成 `chore(sync): 同步代码、文档改动（vX.Y.Z） 日期`） | 无实际改动会直接退出，不会产生空提交 |
 | 4. 推送 | `git push origin <当前分支>` → 打印远端最新短 hash | 非快进先 `git pull --rebase`；凭据过期按 git 自身提示重新登录 |
