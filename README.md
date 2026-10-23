@@ -30,6 +30,8 @@
   避免把"换货后还在"误判成没刷新
 - **换货校验**：接口有缓存，刚过 08/12/16/20 点时可能仍返回上一轮货架。程序会比对
   接口轮次与本地时间应有的轮次，落后就按 30/60/120/180/240 秒重试，拿到新一轮才停
+- **次数用完后可选**：常规重取用尽时，可以选「放弃本轮」（默认，等下次定时查询）或
+  「转入慢速续试」（按 30 分钟间隔继续悄悄试，直到换货）。范围与影响见开发手册第 7 章
 - **假刷新识别**：有的渠道把轮次刷成了新一轮、货架内容却还是旧的，或者压根不返回轮次
   字段（只能拿本地时间兜底）。这类情况下轮次比对看不出问题，界面会卡在「两件全天商品」
   上。程序改为比对货架内容本身：只剩全天商品、且与上次完全相同时，按可配置的间隔
@@ -230,6 +232,9 @@ exe 与源码运行**共用同一份配置**。
 | `auto_recheck_after_refresh` | `true` | 换货后接口未刷新时自动重试 |
 | `recheck_delay_seconds` | `300` | 只剩全天商品且内容未变时，延后多久重取（30–3600 秒） |
 | `recheck_max_attempts` | `3` | 上述情形的最大重取次数（0 = 关闭该判据，0–10） |
+| `recheck_give_up_policy` | `stop` | 次数用完后：`stop` 放弃本轮 / `slow` 转慢速续试 |
+| `recheck_slow_interval_seconds` | `1800` | `slow` 的续试间隔（300–3600 秒） |
+| `recheck_slow_max_attempts` | `0` | `slow` 的续试上限（0 = 不限，直到换货；0–20） |
 | `force_direct` | `true` | 剥离代理变量 + 禁用系统代理，全进程不走 HTTP 代理 |
 | `doh_enabled` | `true` | 用 DoH 取真实 IP，绕开 fake-ip 劫持 |
 | `prefer_cn_region` | `true` | 优先选择中国大陆渠道 |
@@ -277,9 +282,12 @@ roco-merchant/
 ├── notifier.py             # 通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
 ├── notifier_native.py      # WinRT Toast、AppUserModelID、rocomesh:// 协议注册
 ├── applog.py               # 日志与异常钩子
-├── selftest.py             # 自测（127 项）
+├── freshness.py            # 货架新鲜度判定：轮次落后 / 只剩全天商品 / 本轮商品消失
+├── selftest.py             # 自测（233 项）
 ├── tools/make_icon.py      # 纯标准库生成 assets/app.ico
 ├── tools/release.py        # 发布：上传 exe 到 Release + 归档旧版
+├── tools/publish.py        # 改动同步：自测门禁 + 白名单提交 + 推送
+├── sync.bat                # 一键同步到 GitHub（自测 → 提交 → 推送）
 ├── .github/workflows/release.yml  # CI：推 tag 自动打包发布
 ├── assets/app.ico          # 应用图标（构建 exe 用）
 ├── dist/                   # 本地打包产物（.gitignore，不入库）
@@ -300,13 +308,31 @@ roco-merchant/
 python selftest.py
 ```
 
-覆盖 198 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
+覆盖 233 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
 通知 XML 与去重、图标缓存与迁移、缓存/日志目录回退、自启命令拼装、单实例互斥与唤醒、
 悬浮窗渲染与收起、多屏边界（合成三屏，含左侧负坐标副屏）、真实双屏下的副屏落位与持久化、
 托盘创建与清理、关闭到托盘后仍能恢复、界面异常落盘、悬浮窗图标开关（开/关后行数与文字不变）、
-假刷新识别与重取收敛（内容未变 / 货架缩水 / 换渠道 / 打烊 / 次数用尽）、设置面板的重取节奏校验。
+假刷新识别与重取收敛（内容未变 / 货架缩水 / 换渠道 / 打烊 / 慢速续试与上限）、
+设置面板的重取节奏与收尾方式校验、同步脚本的白名单与提交信息拼装。
 
 自测会备份并还原 `config.json` / `state.json` 与注册表自启项，跑完不改变系统状态。
+
+---
+
+## 同步到 GitHub
+
+改完并自测通过后，用一条命令把这次变更同步上去（自测 → 白名单收集 → 提交 → 推送）：
+
+```bat
+sync.bat                       :: 或 python tools/publish.py
+sync.bat -m "fix(x): 修好了"    :: 指定提交信息
+sync.bat --tag v1.4.3          :: 顺便打标签并推送
+python tools/publish.py --dry-run   :: 只看会提交哪些文件
+```
+
+脚本会跳过 `dist/`、`__pycache__/`、`logs/`、`.github/` 等不该入库的东西（`.github/` 需要额外的
+`workflow` scope，推它会让整次 push 失败）。规则、失败处理与"同步 ≠ 发版"的区别见
+**[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) 第 8 章**。
 
 ---
 

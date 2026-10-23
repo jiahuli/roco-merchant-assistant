@@ -24,6 +24,11 @@
 三条判据都要求"货架只剩全天商品"或"轮次明确落后"才成立，所以正常的
 换货（带本轮商品）不会被误判，也就不会扰动既有刷新路径。
 
+常规重取次数用尽后可选择两种收尾方式（`give_up_policy`）：
+`stop`（默认，保留数据并标注"可能未更新"）或 `slow`（转入更长的间隔
+继续悄悄试，直到换轮）。两种方式的上限都由配置给出，便于用户按网络/
+流量习惯取舍，见 `docs/DEVELOPMENT.md`「可配置项与选择机制」。
+
 判定过程是纯状态机，不碰 Tk / 网络，可以直接单测。
 """
 from __future__ import annotations
@@ -53,6 +58,17 @@ CODE_TEXT = {
 DEFAULT_ROUND_DELAYS: tuple[float, ...] = (30.0, 60.0, 120.0, 180.0, 240.0)
 DEFAULT_DELAY = 300.0          # 内容未变时的默认延后：5 分钟
 DEFAULT_MAX_ATTEMPTS = 3       # 内容未变时最多重取几次
+
+# 常规重取次数用尽之后怎么办（用户可选，默认保持 1.4.2 的行为）
+POLICY_STOP = "stop"           # 放弃本轮，保留数据 + 标记"可能未更新"，等下次定时 / 手动
+POLICY_SLOW = "slow"           # 转入慢速续试：隔一段较长时间再悄悄试一次，直到换轮
+GIVE_UP_POLICIES: tuple[str, ...] = (POLICY_STOP, POLICY_SLOW)
+POLICY_TEXT = {
+    POLICY_STOP: "放弃本轮，等下次定时查询",
+    POLICY_SLOW: "转入慢速续试，直到换货或程序退出",
+}
+DEFAULT_SLOW_INTERVAL = 1800.0  # 慢速续试间隔：30 分钟
+DEFAULT_SLOW_MAX = 0            # 慢速续试上限：0 = 不限（直到换轮）
 
 
 def content_signature(items: Iterable) -> str:
@@ -148,6 +164,9 @@ class Recheck:
     delay: float = 0.0
     attempt: int = 0            # 已重取次数（不含本次）
     limit: int = 0              # 允许的最大重取次数
+    slow: bool = False          # 本次属于"放弃后慢速续试"阶段
+    slow_round: int = 0         # 慢速续试第几次（1 起）
+    slow_limit: int = 0         # 慢速续试上限，0 = 不限
 
     @property
     def should_retry(self) -> bool:
@@ -171,6 +190,10 @@ class ShelfWatcher:
 
     反骚扰：同一份内容 + 同一轮次已经放弃过一次，就不再重复重取
     （`_exhausted`），跨轮或内容变化后自动恢复。
+
+    常规次数用尽后怎么走由 `give_up_policy` 决定（`stop` / `slow`）：
+    `stop` 就是 1.4.2 的老行为；`slow` 会转入更长的间隔继续悄悄试，
+    直到换轮、内容变化、慢速上限用尽或用户手动刷新。
     """
 
     def __init__(
@@ -178,14 +201,25 @@ class ShelfWatcher:
         round_delays: Iterable[float] = DEFAULT_ROUND_DELAYS,
         delay: float = DEFAULT_DELAY,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        give_up_policy: str = POLICY_STOP,
+        slow_interval: float = DEFAULT_SLOW_INTERVAL,
+        slow_max_attempts: int = DEFAULT_SLOW_MAX,
     ) -> None:
         self._round_delays: tuple[float, ...] = (30.0,)
         self._delay: float = DEFAULT_DELAY
         self._max_attempts: int = DEFAULT_MAX_ATTEMPTS
+        self._give_up_policy: str = POLICY_STOP
+        self._slow_interval: float = DEFAULT_SLOW_INTERVAL
+        self._slow_max: int = DEFAULT_SLOW_MAX
         self._attempt = 0
+        self._slow_count = 0
         self._last: Optional[ShelfObservation] = None
         self._exhausted: Optional[tuple[str, Optional[int]]] = None
-        self.configure(delay=delay, max_attempts=max_attempts, round_delays=round_delays)
+        self.configure(
+            delay=delay, max_attempts=max_attempts, round_delays=round_delays,
+            give_up_policy=give_up_policy, slow_interval=slow_interval,
+            slow_max_attempts=slow_max_attempts,
+        )
 
     # ---------------------------------------------------------------- 配置
     def configure(
@@ -193,8 +227,29 @@ class ShelfWatcher:
         delay: float | None = None,
         max_attempts: int | None = None,
         round_delays: Iterable[float] | None = None,
+        give_up_policy: str | None = None,
+        slow_interval: float | None = None,
+        slow_max_attempts: int | None = None,
     ) -> None:
-        """热更新节奏；非法值一律夹到可用区间，绝不抛异常打断查询。"""
+        """热更新节奏与策略；非法值一律夹到可用区间，绝不抛异常打断查询。"""
+        if give_up_policy is not None:
+            # 只认白名单，写错就当默认值——配置坏了也不能让程序不工作
+            self._give_up_policy = (
+                give_up_policy if give_up_policy in GIVE_UP_POLICIES else POLICY_STOP
+            )
+        if slow_interval is not None:
+            try:
+                seconds = float(slow_interval)
+            except (TypeError, ValueError):
+                seconds = DEFAULT_SLOW_INTERVAL
+            # 下限只防"0 秒风暴"，业务下限（300 秒）由 Config / 设置界面把关
+            self._slow_interval = max(0.05, min(21600.0, seconds))
+        if slow_max_attempts is not None:
+            try:
+                count = int(slow_max_attempts)
+            except (TypeError, ValueError):
+                count = DEFAULT_SLOW_MAX
+            self._slow_max = max(0, min(20, count))
         if round_delays is not None:
             cleaned = []
             for raw in round_delays:
@@ -235,19 +290,34 @@ class ShelfWatcher:
     def attempt(self) -> int:
         return self._attempt
 
+    @property
+    def slow_count(self) -> int:
+        return self._slow_count
+
+    @property
+    def give_up_policy(self) -> str:
+        return self._give_up_policy
+
+    @property
+    def slow_interval(self) -> float:
+        return self._slow_interval
+
     def reset_attempts(self) -> None:
-        """新一轮换货：清空重取计数，但保留"上一次内容"用于比对。"""
+        """新一轮换货 / 用户主动刷新：清空重取计数，但保留"上一次内容"用于比对。"""
         self._attempt = 0
+        self._slow_count = 0
 
     def seed(self, observation: Optional[ShelfObservation]) -> None:
         """用上次运行留下的货架当历史，冷启动也能立刻发现"没换货"。"""
         if observation is not None:
             self._last = observation
             self._attempt = 0
+            self._slow_count = 0
 
     def forget(self) -> None:
         """彻底忘掉历史（渠道切换 / 退出）。"""
         self._attempt = 0
+        self._slow_count = 0
         self._last = None
         self._exhausted = None
 
@@ -263,9 +333,10 @@ class ShelfWatcher:
 
         same_source = previous is not None and previous.source_id == obs.source_id
         identical = same_source and previous.content == obs.content
-        # 内容变了（或换了渠道）就是新证据，重取预算重新给
+        # 内容变了（或换了渠道）就是新证据，重取预算（含慢速计数）重新给
         if not identical:
             self._attempt = 0
+            self._slow_count = 0
 
         if not obs.all_day_only:
             # 带本轮商品的货架：只认"轮次落后"这一条老判据，新启发式不介入
@@ -289,13 +360,24 @@ class ShelfWatcher:
             self._attempt = 0
             return Recheck(code=code, limit=limit)
 
-        if code != CODE_ROUND_LAG and self._exhausted == (obs.content, obs.round_key):
+        if (self._give_up_policy == POLICY_STOP and code != CODE_ROUND_LAG
+                and self._exhausted == (obs.content, obs.round_key)):
             # 同一内容、同一轮次已经放弃过，别反复骚扰接口
+            # （切到慢速策略后不再受这条限制，由 _slow_max 单独把关）
             self._attempt = 0
             return Recheck(code=code, limit=limit)
 
         self._attempt += 1
         if self._attempt > limit:
+            # 常规次数用尽：按用户选的策略决定是收手，还是转慢速续试
+            if self._give_up_policy == POLICY_SLOW and (
+                    self._slow_max == 0 or self._slow_count < self._slow_max):
+                self._slow_count += 1
+                return Recheck(
+                    action=ACTION_RETRY, code=code, delay=self._slow_interval,
+                    attempt=limit, limit=limit,
+                    slow=True, slow_round=self._slow_count, slow_limit=self._slow_max,
+                )
             if code != CODE_ROUND_LAG:
                 self._exhausted = (obs.content, obs.round_key)
             return Recheck(

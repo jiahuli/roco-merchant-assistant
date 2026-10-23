@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -175,6 +175,10 @@ class Config:
     # 货架只剩全天商品、且内容与上次完全相同时的重取节奏（接口"假刷新"）
     recheck_delay_seconds: int = 300     # 延后多久再取一次（默认 5 分钟）
     recheck_max_attempts: int = 3        # 最多重取几次（0 = 关闭该判据）
+    # 常规重取用尽后的收尾方式：stop = 收手等下次定时；slow = 转慢速续试
+    recheck_give_up_policy: str = "stop"
+    recheck_slow_interval_seconds: int = 1800   # 慢速续试间隔（默认 30 分钟）
+    recheck_slow_max_attempts: int = 0          # 慢速续试上限（0 = 不限，直到换轮）
 
     # 定时查询（24 小时制 HH:MM）
     query_times: list[str] = field(default_factory=lambda: list(QUERY_TIME_PRESETS["默认（刷新后 5 分钟）"]))
@@ -269,6 +273,12 @@ class Config:
         # 也不会把重取打成每秒一次的洪水
         cfg.recheck_delay_seconds = clamp_int(cfg.recheck_delay_seconds, 30, 3600, 300)
         cfg.recheck_max_attempts = clamp_int(cfg.recheck_max_attempts, 0, 10, 3)
+        # 收尾方式只认白名单，写错就回落默认（不认识的值不该让程序失灵）
+        policy = str(cfg.recheck_give_up_policy or "").strip().lower()
+        cfg.recheck_give_up_policy = policy if policy in ("stop", "slow") else "stop"
+        cfg.recheck_slow_interval_seconds = clamp_int(
+            cfg.recheck_slow_interval_seconds, 300, 3600, 1800)
+        cfg.recheck_slow_max_attempts = clamp_int(cfg.recheck_slow_max_attempts, 0, 20, 0)
         if cfg.provider not in cfg.providers:
             cfg.provider = "rkw"
         return cfg

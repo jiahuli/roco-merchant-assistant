@@ -398,6 +398,32 @@ def test_config_roundtrip():
         check("越界次数被夹到上限", loaded.recheck_max_attempts == 10,
               str(loaded.recheck_max_attempts))
 
+        # 收尾方式：可选值 + 白名单兜底 + 慢速参数范围
+        config.recheck_give_up_policy = "slow"
+        config.recheck_slow_interval_seconds = 1200
+        config.recheck_slow_max_attempts = 5
+        config.save(path)
+        loaded = Config.load(path)
+        check("收尾方式可持久化",
+              loaded.recheck_give_up_policy == "slow"
+              and loaded.recheck_slow_interval_seconds == 1200
+              and loaded.recheck_slow_max_attempts == 5,
+              f"{loaded.recheck_give_up_policy}/{loaded.recheck_slow_interval_seconds}"
+              f"/{loaded.recheck_slow_max_attempts}")
+
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["recheck_give_up_policy"] = "retry_forever"
+        raw["recheck_slow_interval_seconds"] = 10
+        raw["recheck_slow_max_attempts"] = 999
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        loaded = Config.load(path)
+        check("未知收尾方式回落 stop", loaded.recheck_give_up_policy == "stop",
+              loaded.recheck_give_up_policy)
+        check("慢速间隔夹到下限", loaded.recheck_slow_interval_seconds == 300,
+              str(loaded.recheck_slow_interval_seconds))
+        check("慢速次数夹到上限", loaded.recheck_slow_max_attempts == 20,
+              str(loaded.recheck_slow_max_attempts))
+
 
 def test_notify_fallback_chain():
     """原生成功时不弹浮窗；原生失败才兜底。"""
@@ -1010,6 +1036,16 @@ def test_settings_recheck_fields():
                   dialog._recheck_delay_var.get() == str(config.recheck_delay_seconds)
                   and dialog._recheck_max_var.get() == str(config.recheck_max_attempts),
                   f"{dialog._recheck_delay_var.get()}/{dialog._recheck_max_var.get()}")
+            check("收尾方式默认放弃本轮", dialog._policy_var.get() == "stop",
+                  dialog._policy_var.get())
+            check("放弃本轮时慢速输入框被禁用",
+                  str(dialog._slow_interval_entry.cget("state")) == "disabled",
+                  str(dialog._slow_interval_entry.cget("state")))
+            dialog._policy_var.set("slow")
+            dialog._sync_slow_fields()
+            check("切到慢速后输入框解禁",
+                  str(dialog._slow_interval_entry.cget("state")) == "normal",
+                  str(dialog._slow_interval_entry.cget("state")))
 
             # 非法值：拦下并保留对话框
             dialog._recheck_delay_var.set("5分钟")
@@ -1020,17 +1056,134 @@ def test_settings_recheck_fields():
 
             dialog._recheck_delay_var.set("600")
             dialog._recheck_max_var.set("4")
+            dialog._slow_interval_var.set("900")
+            dialog._slow_max_var.set("2")
             dialog._save()
             saved = Config.load(path)
             check("重取节奏可保存并生效",
                   saved.recheck_delay_seconds == 600 and saved.recheck_max_attempts == 4,
                   f"{saved.recheck_delay_seconds}/{saved.recheck_max_attempts}")
+            check("收尾方式可保存",
+                  saved.recheck_give_up_policy == "slow"
+                  and saved.recheck_slow_interval_seconds == 900
+                  and saved.recheck_slow_max_attempts == 2,
+                  f"{saved.recheck_give_up_policy}/{saved.recheck_slow_interval_seconds}"
+                  f"/{saved.recheck_slow_max_attempts}")
         finally:
             Config.save = original_save
             try:
                 root.destroy()
             except tk.TclError:
                 pass
+
+
+def test_give_up_policy():
+    """收尾方式可选：stop（默认，原行为）与 slow（慢速续试），互不干扰。"""
+    from freshness import (ACTION_GIVE_UP, ACTION_RETRY, POLICY_SLOW, POLICY_STOP,
+                           ShelfWatcher)
+
+    def snap(items, rnd=2, exp=2):
+        return MerchantSnapshot(items=items, status="open", round_index=rnd,
+                                expected_round=exp, source_id="rkw")
+
+    def ball():
+        return MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
+
+    # 默认必须是 stop：不显式配置时行为与 1.4.2 完全一致
+    default = ShelfWatcher(delay=300, max_attempts=2)
+    check("默认收尾方式是放弃本轮", default.give_up_policy == POLICY_STOP,
+          default.give_up_policy)
+    default.observe(snap([ball()]))
+    default.observe(snap([ball()]))
+    default.observe(snap([ball()]))
+    check("默认策略用尽即放弃",
+          default.observe(snap([ball()])).action == ACTION_GIVE_UP)
+
+    # slow：常规次数用完后转慢速，间隔取 slow_interval
+    slow = ShelfWatcher(delay=300, max_attempts=2, give_up_policy=POLICY_SLOW,
+                        slow_interval=1800, slow_max_attempts=0)
+    slow.observe(snap([ball()]))            # 初次，不重取
+    first = slow.observe(snap([ball()]))    # 第 1 次常规重取
+    second = slow.observe(snap([ball()]))   # 第 2 次常规重取
+    third = slow.observe(snap([ball()]))    # 常规用尽 → 转慢速
+    check("慢速策略先走常规节奏",
+          first.should_retry and not first.slow and first.delay == 300, str(first))
+    check("常规次数用完后转慢速",
+          third.should_retry and third.slow and third.delay == 1800, str(third))
+    check("慢速轮次从 1 开始", third.slow_round == 1, str(third.slow_round))
+    fourth = slow.observe(snap([ball()]))
+    check("慢速可连续续试", fourth.should_retry and fourth.slow_round == 2, str(fourth))
+    check("常规次数展示不因慢速而虚增", fourth.attempt == 2 and fourth.limit == 2,
+          f"{fourth.attempt}/{fourth.limit}")
+    check("不限次数时 slow_limit 为 0", fourth.slow_limit == 0, str(fourth.slow_limit))
+
+    # slow + 上限：用尽后回到放弃
+    limited = ShelfWatcher(delay=300, max_attempts=1, give_up_policy=POLICY_SLOW,
+                           slow_interval=1800, slow_max_attempts=2)
+    limited.observe(snap([ball()]))
+    limited.observe(snap([ball()]))   # 常规 1
+    s1 = limited.observe(snap([ball()]))
+    s2 = limited.observe(snap([ball()]))
+    s3 = limited.observe(snap([ball()]))
+    check("慢速上限内仍续试", s1.slow and s2.slow, f"{s1.slow}/{s2.slow}")
+    check("慢速上限用尽即放弃", s3.action == ACTION_GIVE_UP, str(s3))
+
+    # 慢速期间内容变化 → 退出慢速，回到常规预算
+    changed = ShelfWatcher(delay=300, max_attempts=2, give_up_policy=POLICY_SLOW,
+                           slow_interval=1800, slow_max_attempts=0)
+    changed.observe(snap([ball()]))
+    changed.observe(snap([ball()]))
+    changed.observe(snap([ball()]))
+    changed.observe(snap([ball()]))
+    after = changed.observe(snap([ball(), MerchantItem("血脉药", 100, 1, rounds=(2,))]))
+    check("内容变化后退出慢速", after.action != ACTION_RETRY and changed.slow_count == 0,
+          f"{after.action}/{changed.slow_count}")
+
+    # 从 stop 切到 slow：不该被之前的"已放弃"标记挡住
+    switched = ShelfWatcher(delay=300, max_attempts=1)
+    switched.observe(snap([ball()]))
+    switched.observe(snap([ball()]))
+    switched.observe(snap([ball()]))          # 放弃，落 _exhausted
+    switched.configure(give_up_policy=POLICY_SLOW, slow_interval=1800)
+    revived = switched.observe(snap([ball()]))
+    check("切到慢速后可继续续试", revived.should_retry and revived.slow, str(revived))
+
+    # 非法策略值回落默认
+    bad = ShelfWatcher(give_up_policy="whatever")
+    check("非法策略回落 stop", bad.give_up_policy == POLICY_STOP, bad.give_up_policy)
+    bad.configure(slow_interval=1, slow_max_attempts=999)
+    check("慢速参数被夹取", bad.slow_interval == 1 and bad.max_attempts == 3,
+          f"{bad.slow_interval}")
+
+
+def test_publish_script():
+    """同步脚本的纯逻辑：哪些文件该推、提交信息怎么拼。"""
+    import importlib.util
+    from datetime import datetime
+
+    spec = importlib.util.spec_from_file_location(
+        "publish_tool", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "tools", "publish.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    check("源码可同步", module.is_publishable("freshness.py"))
+    check("文档可同步", module.is_publishable("docs/DEVELOPMENT.md"))
+    check("脚本可同步", module.is_publishable("sync.bat"))
+    check("产物不同步", not module.is_publishable("dist/远行商人助手.exe", 1024))
+    check("构建目录不同步", not module.is_publishable("build/x.py"))
+    check("缓存不同步", not module.is_publishable("__pycache__/config.cpython-313.pyc"))
+    check("CI 目录不同步", not module.is_publishable(".github/workflows/release.yml"))
+    check("日志不同步", not module.is_publishable("logs/app.log"))
+    check("超大文件不同步", not module.is_publishable("assets/big.png", 30 * 1024 * 1024))
+    check("反斜杠路径也能识别", module.is_publishable("ui\\app_window.py"))
+
+    msg = module.build_commit_message(["ui/app_window.py", "README.md"], "1.4.3",
+                                      datetime(2026, 10, 23, 21, 0))
+    check("提交信息含类型与日期", "代码" in msg and "文档" in msg and "2026-10-23" in msg, msg)
+    check("提交信息带版本号", "v1.4.3" in msg, msg)
+    check("无版本号时不出现空括号",
+          "（v" not in module.build_commit_message(["README.md"]))
 
 
 def test_netdirect_proxy_strip():
@@ -1351,6 +1504,7 @@ def _run_all():
                test_floating_multimonitor, test_logging, test_tk_error_hook,
                test_rounds_parsing, test_round_lag_detection, test_round_retry_flow,
                test_shelf_freshness_rules, test_all_day_recheck_flow,
+               test_give_up_policy, test_publish_script,
                test_settings_recheck_fields,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
                test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,

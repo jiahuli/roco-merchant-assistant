@@ -57,6 +57,9 @@ class MerchantApp:
             round_delays=self.ROUND_RETRY_DELAYS,
             delay=config.recheck_delay_seconds,
             max_attempts=config.recheck_max_attempts,
+            give_up_policy=config.recheck_give_up_policy,
+            slow_interval=config.recheck_slow_interval_seconds,
+            slow_max_attempts=config.recheck_slow_max_attempts,
         )
         self._shelf_state_key: tuple[str, int | None] | None = None
         self._restore_shelf_state()
@@ -548,9 +551,11 @@ class MerchantApp:
             return
 
         self._show_recheck_pending(snapshot, reason, decision)
-        applog.info("换货校验 | %s | 第 %s 轮 | %s 件 | %s 秒后第 %s/%s 次重取",
+        applog.info("换货校验 | %s | 第 %s 轮 | %s 件 | %s 秒后第 %s/%s 次重取%s",
                     decision.code_text, snapshot.round_index, len(snapshot.items),
-                    int(decision.delay), decision.attempt, decision.limit)
+                    int(decision.delay), decision.attempt, decision.limit,
+                    f"（慢速 {decision.slow_round}/{decision.slow_limit or '不限'}）"
+                    if decision.slow else "")
         self._schedule_recheck(decision.delay)
 
     def _show_recheck_pending(self, snapshot: MerchantSnapshot, reason: str, decision) -> None:
@@ -567,6 +572,19 @@ class MerchantApp:
         else:
             detail = f"本轮仅 {count} 件全天商品、与上次完全相同"
             note = f"⚠ 货架只剩 {count} 件全天商品，疑似接口还没换货，正在重试"
+
+        if decision.slow:
+            # 放弃后仍选了"慢速续试"：文案要说清这是低频兜底，不是正常节奏
+            rounds = f"{decision.slow_round}/{decision.slow_limit or '不限'}"
+            self.status_left.configure(
+                text=f"{reason} · {detail}，常规重试已用完，{delay_text}后再看一眼"
+                     f"（慢速 {rounds}）",
+                fg=WARNING,
+            )
+            self.pill.set_state("慢速校验", WARNING)
+            self._set_shelf_note(note.replace("正在重试", "会定期再看"))
+            return
+
         self.status_left.configure(
             text=f"{reason} · {detail}，{delay_text}后重试"
                  f"（{decision.attempt}/{decision.limit}）",
@@ -1050,6 +1068,9 @@ class MerchantApp:
             delay=new_config.recheck_delay_seconds,
             max_attempts=new_config.recheck_max_attempts,
             round_delays=self.ROUND_RETRY_DELAYS,
+            give_up_policy=new_config.recheck_give_up_policy,
+            slow_interval=new_config.recheck_slow_interval_seconds,
+            slow_max_attempts=new_config.recheck_slow_max_attempts,
         )
         if not new_config.auto_recheck_after_refresh:
             self._cancel_round_retry()

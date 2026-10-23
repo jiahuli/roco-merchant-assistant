@@ -11,6 +11,7 @@ import autostart
 import notifier_native
 from cache import IconCache
 from config import QUERY_TIME_PRESETS, Config, resolve_icon_cache_dir, sanitize_times
+from freshness import GIVE_UP_POLICIES, POLICY_SLOW, POLICY_STOP
 from rarity import RARITY_TABLE
 from ui import theme
 from ui.theme import (ACCENT, BG, BORDER, BORDER_HOVER, DANGER, MUTED, SURFACE,
@@ -138,15 +139,57 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(tune, text="次（0 = 关闭该判据）", bg=SURFACE, fg=TEXT_DIM,
                  font=ui_font(9)).pack(side="left")
 
+        # 常规次数用尽后的收尾方式：给用户选择权，默认保持"放弃本轮"
+        policy_row = tk.Frame(holder, bg=SURFACE)
+        policy_row.pack(fill="x", pady=(10, 0))
+        tk.Label(policy_row, text="次数用完后", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left", padx=(0, 10))
+        self._policy_var = tk.StringVar(value=self._draft.recheck_give_up_policy)
+        for value, text in ((POLICY_STOP, "放弃本轮"), (POLICY_SLOW, "转入慢速续试")):
+            tk.Radiobutton(
+                policy_row, text=text, value=value, variable=self._policy_var,
+                bg=SURFACE, fg=TEXT_DIM, activebackground=SURFACE, activeforeground=TEXT,
+                selectcolor=SURFACE_2, font=ui_font(9), bd=0, highlightthickness=0,
+                command=self._sync_slow_fields,
+            ).pack(side="left", padx=(0, 12))
+
+        slow_row = tk.Frame(holder, bg=SURFACE)
+        slow_row.pack(fill="x", pady=(8, 0))
+        tk.Label(slow_row, text="慢速间隔", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left")
+        self._slow_interval_var = tk.StringVar(
+            value=str(self._draft.recheck_slow_interval_seconds))
+        self._slow_interval_entry = _entry(slow_row, self._slow_interval_var, width=6)
+        self._slow_interval_entry.pack(side="left", ipady=4, padx=(6, 4))
+        tk.Label(slow_row, text="秒，最多", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left")
+        self._slow_max_var = tk.StringVar(value=str(self._draft.recheck_slow_max_attempts))
+        self._slow_max_entry = _entry(slow_row, self._slow_max_var, width=4)
+        self._slow_max_entry.pack(side="left", ipady=4, padx=(6, 4))
+        tk.Label(slow_row, text="次（0 = 不限，直到换货）", bg=SURFACE, fg=TEXT_DIM,
+                 font=ui_font(9)).pack(side="left")
+        self._sync_slow_fields()
+
         tk.Label(
             holder,
             text="提示：商人在 08:00 / 12:00 / 16:00 / 20:00 换货，默认取整点后 5 分钟查询。"
                  "接口有缓存，刚换货时可能仍返回上一轮的货架——开启上面的选项后，"
                  "接口轮次落后时按 30/60/120/180/240 秒阶梯重试；"
                  "若货架只剩全天在售的商品（条件球这类）且内容与上次完全相同，"
-                 "则按上面的秒数延后重取，最多重取指定次数。",
+                 "则按上面的秒数延后重取，最多重取指定次数。"
+                 "次数用完后可选「放弃本轮」（默认，等下次定时查询）或"
+                 "「转入慢速续试」（按慢速间隔悄悄再试，换货即停）。",
             bg=SURFACE, fg=MUTED, font=ui_font(8), justify="left", wraplength=580,
         ).pack(fill="x", pady=(6, 0))
+
+    def _sync_slow_fields(self) -> None:
+        """放弃本轮时慢速参数无意义，灰掉避免误解（值仍保留，切回来还在）。"""
+        state = "normal" if self._policy_var.get() == POLICY_SLOW else "disabled"
+        for entry in (self._slow_interval_entry, self._slow_max_entry):
+            try:
+                entry.configure(state=state)
+            except tk.TclError:
+                pass
 
     # -------------------------------------------------------------- 数据渠道
     def _build_provider(self, master: tk.Misc) -> None:
@@ -587,6 +630,44 @@ class SettingsDialog(tk.Toplevel):
                 text="最多重取次数需在 0 ~ 10 之间（0 = 关闭该判据）", fg=theme.DANGER)
             return
 
+        # 收尾方式：选了慢速才强校验慢速参数；选"放弃本轮"时脏值回落默认即可
+        policy = self._policy_var.get()
+        if policy not in GIVE_UP_POLICIES:
+            policy = POLICY_STOP
+        slow_interval, slow_max = 1800, 0
+        if policy == POLICY_SLOW:
+            try:
+                slow_interval = int(str(self._slow_interval_var.get()).strip())
+            except (TypeError, ValueError):
+                self._error.configure(
+                    text="慢速间隔要填整数秒，例如 1800（= 30 分钟）", fg=theme.DANGER)
+                return
+            if not 300 <= slow_interval <= 3600:
+                self._error.configure(
+                    text="慢速间隔需在 300 ~ 3600 秒之间（推荐 1800 = 30 分钟）",
+                    fg=theme.DANGER)
+                return
+            try:
+                slow_max = int(str(self._slow_max_var.get()).strip())
+            except (TypeError, ValueError):
+                self._error.configure(
+                    text="慢速次数要填整数，例如 0（= 不限）", fg=theme.DANGER)
+                return
+            if not 0 <= slow_max <= 20:
+                self._error.configure(
+                    text="慢速次数需在 0 ~ 20 之间（0 = 不限）", fg=theme.DANGER)
+                return
+        else:
+            # 数值仍是用户之前的输入，能读就读，读不出就用默认值，不打断保存
+            try:
+                slow_interval = min(3600, max(300, int(str(self._slow_interval_var.get()).strip())))
+            except (TypeError, ValueError):
+                slow_interval = 1800
+            try:
+                slow_max = min(20, max(0, int(str(self._slow_max_var.get()).strip())))
+            except (TypeError, ValueError):
+                slow_max = 0
+
         self._store_provider_fields(self._current_pid)
 
         draft = self._draft
@@ -596,6 +677,9 @@ class SettingsDialog(tk.Toplevel):
         draft.auto_recheck_after_refresh = bool(self._recheck_var.get())
         draft.recheck_delay_seconds = delay
         draft.recheck_max_attempts = attempts
+        draft.recheck_give_up_policy = policy
+        draft.recheck_slow_interval_seconds = slow_interval
+        draft.recheck_slow_max_attempts = slow_max
         draft.force_direct = bool(self._direct_var.get())
         draft.doh_enabled = bool(self._doh_var.get())
         draft.prefer_cn_region = bool(self._cn_var.get())
