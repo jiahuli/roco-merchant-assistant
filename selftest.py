@@ -126,7 +126,7 @@ def test_provider_fallback():
     config.auto_fallback = True
     try:
         snapshot, errors = fetch_snapshot(config)
-        ok = snapshot is not None and snapshot.source_id in ("rkw", "yxsr")
+        ok = snapshot is not None and snapshot.source_id in ("onebiji", "yxsr")
         check("官方未配置时自动降级", ok, f"来源={snapshot.source_id} 错误={errors[:1]}")
         check("降级留痕", bool(errors), str(errors[:1]))
     except ProviderError as exc:
@@ -384,7 +384,7 @@ def test_config_roundtrip():
               loaded.icon_cache_path == "D:/icons" and loaded.autostart is True
               and loaded.floating_enabled is True and loaded.floating_topmost is False)
         check("老配置向后兼容",
-              loaded.query_times == config.query_times and loaded.provider == "rkw")
+              loaded.query_times == config.query_times and loaded.provider == "onebiji")
 
         # 换货重取节奏：可配置 + 越界/脏数据自动夹回安全区间
         config.recheck_delay_seconds = 900
@@ -784,7 +784,7 @@ def test_shelf_freshness_rules():
     from freshness import (ACTION_GIVE_UP, ACTION_RETRY, CODE_ALL_DAY_ONLY,
                            CODE_ROUND_LAG, CODE_SHELF_SHRANK, ShelfWatcher)
 
-    def snap(items, rnd=2, exp=2, status="open", src="rkw"):
+    def snap(items, rnd=2, exp=2, status="open", src="onebiji"):
         return MerchantSnapshot(items=items, status=status, round_index=rnd,
                                 expected_round=exp, source_id=src)
 
@@ -846,7 +846,7 @@ def test_shelf_freshness_rules():
     check("空货架不重取", not empty.observe(snap([])).should_retry)
 
     switched = ShelfWatcher()
-    switched.observe(snap([ball()], src="rkw"))
+    switched.observe(snap([ball()], src="onebiji"))
     check("换渠道后不误判为未变",
           not switched.observe(snap([ball()], src="custom")).should_retry)
 
@@ -875,7 +875,7 @@ def test_shelf_freshness_rules():
             {"name": "旧轮药水", "price": 100, "limit": 1, "rounds": [1]},
         ],
     }
-    stale = snapshot_from_payload(stale_payload, "rkw", "测试渠道")
+    stale = snapshot_from_payload(stale_payload, "onebiji", "测试渠道")
     check("卡住的现场：只剩两件全天商品",
           len(stale.items) == 2 and stale.all_day_count == 2, str([i.name for i in stale.items]))
     check("剔除数被记录（日志可追溯）", stale.dropped_count == 1, str(stale.dropped_count))
@@ -883,7 +883,7 @@ def test_shelf_freshness_rules():
 
     stuck = ShelfWatcher(delay=300, max_attempts=2)
     first_see = stuck.observe(stale)
-    second_see = stuck.observe(snapshot_from_payload(stale_payload, "rkw", "测试渠道"))
+    second_see = stuck.observe(snapshot_from_payload(stale_payload, "onebiji", "测试渠道"))
     check("首见不重取", first_see.action != ACTION_RETRY, str(first_see))
     check("连见两次完全相同 → 触发延后重取",
           second_see.should_retry and second_see.code == CODE_ALL_DAY_ONLY
@@ -898,7 +898,7 @@ def test_shelf_freshness_rules():
         ],
     }
     check("接口恢复后不再重取",
-          not stuck.observe(snapshot_from_payload(healed, "rkw", "测试渠道")).should_retry)
+          not stuck.observe(snapshot_from_payload(healed, "onebiji", "测试渠道")).should_retry)
 
 
 def test_all_day_recheck_flow():
@@ -1091,7 +1091,7 @@ def test_give_up_policy():
 
     def snap(items, rnd=2, exp=2):
         return MerchantSnapshot(items=items, status="open", round_index=rnd,
-                                expected_round=exp, source_id="rkw")
+                                expected_round=exp, source_id="onebiji")
 
     def ball():
         return MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
@@ -1191,6 +1191,106 @@ def test_publish_script():
     check("提交信息带版本号", "v1.4.3" in msg, msg)
     check("无版本号时不出现空括号",
           "（v" not in module.build_commit_message(["README.md"]))
+
+
+def test_provider_onebiji():
+    """中文查询器：页面解析、同名多轮合并、渠道注册与老配置迁移。"""
+    from config import DEFAULT_PROVIDERS
+    from providers import (_REGISTRY, filter_by_round, parse_bwiki_shops,
+                           parse_onebiji_html)
+
+    page = '''
+    <ul class="shop-list">
+      <li class="all_show li_show on show_1 show_2 show_3 show_4 " data-time="1792857600"
+          onclick="showShopinfo('https://img/1.png','网兜球','特制咕噜球','更适合用来捕捉水系精灵。')">
+        <div class="gitem"><img src="https://img/1.png" alt=""><em>限购100</em></div>
+        <div class="sp-text"><p><em class="shop_name">网兜球</em></p>
+          <div><em class="shop_price">价格：3000 </em></div></div>
+      </li>
+      <li class="all_show li_show on show_1 " data-time="1792814400"
+          onclick="showShopinfo('https://img/2.png','神奇的蛋','精灵蛋','蕴含着难以捉摸的魔力。')">
+        <div class="gitem"><img src="https://img/2.png" alt=""><em>限购5</em></div>
+        <div class="sp-text"><p><em class="shop_name">神奇的蛋</em></p>
+          <div><em class="shop_price">价格：36,000 </em></div></div>
+      </li>
+      <li class="all_show li_show on show_3 " data-time="1792828800"
+          onclick="showShopinfo('https://img/2.png','神奇的蛋','精灵蛋','蕴含着难以捉摸的魔力。')">
+        <div class="gitem"><img src="https://img/2.png" alt=""><em>限购5</em></div>
+        <div class="sp-text"><p><em class="shop_name">神奇的蛋</em></p>
+          <div><em class="shop_price">价格：36,000 </em></div></div>
+      </li>
+      <li class="all_show li_show" onclick="showShopinfo('','','','')">
+        <div class="gitem"><img src="https://img/9.png" alt=""></div>
+      </li>
+    </ul>
+    '''
+    items = parse_onebiji_html(page)
+    by_name = {item.name: item for item in items}
+    check("解析出商品（跳过无名占位）", len(items) == 2, str([i.name for i in items]))
+
+    ball = by_name["网兜球"]
+    check("全天轮次识别", ball.rounds == (1, 2, 3, 4) and ball.is_all_day, str(ball.rounds))
+    check("价格与限购", ball.price == 3000 and ball.limit == 100,
+          f"{ball.price}/{ball.limit}")
+    check("图标与分类",
+          ball.icon_url.endswith("1.png") and ball.category == "特制咕噜球",
+          f"{ball.icon_url}/{ball.category}")
+    check("描述被带出", "水系精灵" in ball.description, ball.description[:20])
+
+    egg = by_name["神奇的蛋"]
+    check("同名多轮合并", egg.rounds == (1, 3), str(egg.rounds))
+    check("千分位价格可解析", egg.price == 36000, str(egg.price))
+    check("非全天商品不误判", not egg.is_all_day)
+
+    kept, dropped = filter_by_round(items, 3)
+    check("按轮次筛选",
+          [i.name for i in kept] == ["网兜球", "神奇的蛋"] and len(dropped) == 0,
+          f"{[i.name for i in kept]}/{len(dropped)}")
+
+    # BWIKI 只能给出商店目录（这就是它不能当数据源的原因）
+    shops = parse_bwiki_shops(
+        '<tr class="divsort shopdex-shop-row"><td>'
+        '<span class="shopdex-shop-name">远行商人</span>'
+        '<span class="shopdex-shop-id">#2002</span>'
+        '<span class="shopdex-shop-count">1 件</span></td></tr>')
+    check("BWIKI 商店行解析", shops == [("远行商人", 1)], str(shops))
+
+    # 渠道注册 / 默认值 / 顺序
+    check("onebiji 已注册", "onebiji" in _REGISTRY)
+    check("bwiki 已注册", "bwiki" in _REGISTRY)
+    check("英文镜像已下线", "rkw" not in _REGISTRY and "rkw" not in DEFAULT_PROVIDERS)
+    check("默认渠道是中文查询器", Config().provider == "onebiji", Config().provider)
+    order = Config().provider_order()
+    check("降级顺序含新渠道",
+          order.index("cn_mirror") < order.index("onebiji") < order.index("bwiki") < order.index("yxsr"),
+          str(order))
+    check("BWIKI 默认不填地址（避免误用）",
+          not Config().providers["bwiki"]["base_url"],
+          Config().providers["bwiki"]["base_url"])
+
+    # 自建反代既能转发 JSON，也能转发页面（HTML → items）
+    from providers import CnMirrorProvider
+
+    mirror = CnMirrorProvider({"base_url": "https://mirror.example/merchant"})
+    mirror._request_text = lambda url, headers=None, use_doh=True: page
+    mirrored = mirror.fetch()
+    check("反代页面也能解析", len(mirrored.items) == 2 and mirrored.source_id == "cn_mirror",
+          f"{len(mirrored.items)}/{mirrored.source_id}")
+
+    # 老配置：provider=rkw + 残留 rkw 条目 → 迁移到 onebiji 并清理
+    import json
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "config.json"
+        raw = {"provider": "rkw",
+               "providers": {"rkw": {"base_url": "https://old.example/api"}}}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        loaded = Config.load(path)
+        check("老 provider=rkw 迁移到 onebiji", loaded.provider == "onebiji", loaded.provider)
+        check("老 rkw 条目被清理", "rkw" not in loaded.providers,
+              str(list(loaded.providers)))
 
 
 def test_netdirect_proxy_strip():
@@ -1310,7 +1410,7 @@ def test_cn_mirror_provider():
     check("大陆反代为未配置状态", not provider.is_configured())
 
     order = config.provider_order()
-    check("大陆反代排在社区镜像之前", order.index("cn_mirror") < order.index("rkw"), str(order))
+    check("大陆反代排在中文查询器之前", order.index("cn_mirror") < order.index("onebiji"), str(order))
 
     check("新增网络配置项存在",
           all(hasattr(config, name) for name in
@@ -1511,7 +1611,7 @@ def _run_all():
                test_floating_multimonitor, test_logging, test_tk_error_hook,
                test_rounds_parsing, test_round_lag_detection, test_round_retry_flow,
                test_shelf_freshness_rules, test_all_day_recheck_flow,
-               test_give_up_policy, test_publish_script,
+               test_provider_onebiji, test_give_up_policy, test_publish_script,
                test_settings_recheck_fields,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
                test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,

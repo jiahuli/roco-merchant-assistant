@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -47,14 +47,28 @@ DEFAULT_PROVIDERS: dict[str, dict[str, Any]] = {
                 "不会绕到 VPN 节点。docs/cn-mirror.md 有一份可直接用的配置。",
         "official": False,
     },
-    "rkw": {
-        "label": "社区镜像 · 洛克 Wiki",
-        "region": "overseas",
-        "base_url": "https://rocokingdomworld.org/api/merchant",
+    "onebiji": {
+        "label": "社区数据 · 每日商人查询器（中文）",
+        "region": "cn",
+        "base_url": "https://www.onebiji.com/hykb_tools/comm/lkwgmerchant/preview.php?id=1&immgj=0",
         "api_key": "",
-        "note": "免费、免 Key，字段最全（价格 / 限购 / 图标 / 轮次 / 下次刷新），默认渠道。"
-                "注意它托管在 Cloudflare（境外 IP），会被路由器端代理转发。",
         "preferred_ip": "",
+        "note": "中文站点，免 Key。页面直接列出今天全部 4 轮的商品：名称 / 价格 / 限购 / 图标 / "
+                "分类 / 每件在哪些轮次售卖（类名 show_1..show_4），程序按轮次筛出本轮货架。"
+                "老默认渠道（英文 Cloudflare 镜像）的数据其实也来自这里，且下游缓存更厚；"
+                "直连本页可少一层中转，换货后更新更及时。",
+        "official": False,
+    },
+    "bwiki": {
+        "label": "哔哩哔哩 Wiki · 商店目录（无货架）",
+        "region": "cn",
+        # 默认留空：它没有每轮货架数据，填上地址也只会得到明确报错，属预留位。
+        "base_url": "",
+        "api_key": "",
+        "note": "BWIKI 只有「商店一览」目录（110 家商店、1106 件商品），页面明确不列价格，"
+                "也没有轮次与刷新时间，DOM 里商品也不与商店归组——无法充当货架数据源。"
+                "如需核对目录，可填："
+                "https://wiki.biligame.com/rocom/api.php?action=parse&page=%E5%95%86%E5%BA%97%E4%B8%80%E8%A7%88&prop=text&format=json&formatversion=2",
         "official": False,
     },
     "yxsr": {
@@ -62,7 +76,8 @@ DEFAULT_PROVIDERS: dict[str, dict[str, Any]] = {
         "region": "overseas",
         "base_url": "https://yxsr.vercel.app/api/merchant",
         "api_key": "",
-        "note": "免费免 Key，但只返回商品名，不含价格与图标，作为极简兜底。",
+        "note": "只返回商品名，不含价格与图标。2026-10 实测其证书已变成自签名，"
+                "程序会按设计拒绝连接，仅作历史渠道保留（可在设置里改地址后启用）。",
         "official": False,
     },
     "shallow": {
@@ -160,7 +175,7 @@ def resolve_icon_cache_dir(config: "Config") -> tuple[Path, str]:
 @dataclass
 class Config:
     # 数据渠道
-    provider: str = "rkw"
+    provider: str = "onebiji"
     auto_fallback: bool = True          # 当前渠道失败时自动尝试下一个可用渠道
     request_timeout: int = 15
 
@@ -279,8 +294,14 @@ class Config:
         cfg.recheck_slow_interval_seconds = clamp_int(
             cfg.recheck_slow_interval_seconds, 300, 3600, 1800)
         cfg.recheck_slow_max_attempts = clamp_int(cfg.recheck_slow_max_attempts, 0, 20, 0)
+
+        # 1.6.0：下掉英文镜像 rkw（更新慢 + 境外 Cloudflare），默认改用中文查询器。
+        # 老配置里残留的 rkw 条目与 provider=rkw 都要迁移，否则会指向一个不存在的渠道。
+        cfg.providers.pop("rkw", None)
+        if cfg.provider == "rkw":
+            cfg.provider = "onebiji"
         if cfg.provider not in cfg.providers:
-            cfg.provider = "rkw"
+            cfg.provider = "onebiji"
         return cfg
 
     # ---------------- 工具 ----------------
@@ -291,12 +312,13 @@ class Config:
         return self.providers.get(pid, {}).get("label", pid)
 
     def provider_order(self) -> list[str]:
-        """自动降级顺序：官方 → 大陆反代 → 社区免费 → 需 Key → 自定义。
+        """自动降级顺序：官方 → 大陆反代 → 中文查询器 → Wiki 目录 → 需 Key → 自定义。
 
-        大陆反代排在社区镜像之前：它一旦配置好，目标 IP 就在大陆，
-        路由器端分流会放行直连，不必绕 VPN 节点。
+        大陆反代排在最前：它一旦配置好，目标 IP 就在大陆，路由器端分流会放行直连。
+        bwiki 虽然默认未配置，但保留在顺序里：用户填了地址就会排在 yxsr 之前，
+        并给出"该渠道没有货架数据"的明确原因。
         """
-        order = ["official", "cn_mirror", "rkw", "yxsr", "shallow", "custom"]
+        order = ["official", "cn_mirror", "onebiji", "bwiki", "yxsr", "shallow", "custom"]
         return [p for p in order if p in self.providers]
 
 

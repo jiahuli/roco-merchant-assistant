@@ -1,6 +1,19 @@
-# 让接口真正落地中国大陆（大陆反代）
+# 自建大陆反代（可选）
 
-## 为什么需要这一步
+## 1.6.0 之后还需要这一步吗
+
+**多数人不需要。** 1.6.0 起默认渠道已换成境内站点（`onebiji` 中文查询器），
+不再有"为了绕过境外链路的缓存层"这个动机。这一步现在只解决三件事：
+
+| 目的 | 说明 |
+| --- | --- |
+| 缓存 | 同一局域网多台机器 / 多个工具同时查，只打一次源站 |
+| 统一出口 | 源站按 IP 限流时，用一台境内机器统一出口 |
+| 换源 | 将来默认源再变，只改反代上游，客户端不用动 |
+
+下面保留完整方案，按需启用；不用就跳过这一章。
+
+## 为什么"客户端绕不过透明代理"（了解即可）
 
 程序已经做到三件事：
 
@@ -24,8 +37,11 @@ API 站点 /cdn-cgi/trace          → ip=198.51.100.20 colo=LAX
 所以"不被代理接管"和"接口在中国大陆"其实是同一个问题——
 只要目标 IP 落在大陆，Clash 的 `GEOIP,CN,DIRECT` 就会放行，链路自然干净。
 
-社区镜像 `rocokingdomworld.org` 托管在 Cloudflare（`104.21.43.145` / `172.67.180.76`），
-境外 IP，必然被转发。想让接口在大陆，只有一条路：**自己在境内放一个反代**。
+历史上默认渠道是境外 Cloudflare 上的镜像，必然被路由器转发，所以需要"境内反代"这一招。
+1.6.0 的默认源本身就在境内（`www.onebiji.com`），直连即可；下面的反代只在上面三种场景才有意义。
+
+> 反代目标是一张 **HTML 页面**，不是 JSON。`cn_mirror` 渠道现在会先尝试 JSON 解析、
+> 失败后再按同一套页面规则解析，所以直接把页面原样转发即可，不需要写转换层。
 
 ## 方案 A：Nginx 反代（推荐，一台 1 核 1G 的境内机器足够）
 
@@ -41,16 +57,16 @@ server {
     ssl_certificate     /etc/nginx/ssl/roco.pem;
     ssl_certificate_key /etc/nginx/ssl/roco.key;
 
-    location = /api/merchant {
-        proxy_pass https://rocokingdomworld.org/api/merchant;
+    # 对外暴露成 /merchant，内部转成查询器的完整 URL（带 query，必须用 = 精确匹配）
+    location = /merchant {
+        proxy_pass "https://www.onebiji.com/hykb_tools/comm/lkwgmerchant/preview.php?id=1&immgj=0";
 
-        # 回源时用目标站点的域名做 SNI，否则 Cloudflare 会返回 403
-        proxy_set_header Host rocokingdomworld.org;
+        # 回源用源站域名做 SNI，并把 Host 一起改掉；少了这两行可能落到默认站点
+        proxy_set_header Host www.onebiji.com;
         proxy_ssl_server_name on;
-        proxy_ssl_name rocokingdomworld.org;
+        proxy_ssl_name www.onebiji.com;
 
-        # 缓存 55 秒：社区接口本身就是 4 小时一轮，1 分钟缓存完全够用，
-        # 既省跨境流量，也避免多个客户端同时打爆源站
+        # 缓存 55 秒：一轮 4 小时，1 分钟缓存足够，既省源站压力也不会盖过换货节奏
         proxy_cache roco;
         proxy_cache_valid 200 55s;
         proxy_cache_lock on;
@@ -65,12 +81,13 @@ server {
 要点：
 
 - 必须用**自己的域名 + 有效证书**。不要用 IP 直连 HTTPS，证书过不了，程序会按设计拒绝连接。
-- `proxy_ssl_name` 不能省。少了它回源 SNI 是你自己的域名，Cloudflare 直接 403。
-- 缓存时长别超过 300 秒，否则会盖过接口本身的换货节奏。
+- `proxy_ssl_name` 不能省。少了它回源 SNI 是你自己的域名，源站可能直接返回错误页或落到默认站点。
+- 缓存时长别超过 300 秒，否则会盖过接口本身的换货节奏；`55s` 与源站页面的刷新节奏匹配。
 - 域名需要备案（境内服务器 80/443 的合规要求），这条没法绕。
 
-1Panel / 宝塔用户：新建"反向代理"站点，目标填 `https://rocokingdomworld.org`，
-开启"发送域名 `rocokingdomworld.org`"，再在配置里补 `proxy_ssl_name` 与缓存两行即可。
+1Panel / 宝塔用户：新建"反向代理"站点，目标填
+`https://www.onebiji.com/hykb_tools/comm/lkwgmerchant/preview.php?id=1&immgj=0`，
+开启"发送域名 `www.onebiji.com`"，再在配置里补 `proxy_ssl_name` 与缓存两行即可。
 
 ## 方案 B：腾讯云函数 / 阿里云函数（无服务器，按量计费）
 
@@ -79,36 +96,39 @@ server {
 import time
 import requests
 
-_CACHE = {"at": 0.0, "body": b"", "ctype": "application/json"}
+SOURCE = ("https://www.onebiji.com/hykb_tools/comm/lkwgmerchant/preview.php"
+          "?id=1&immgj=0")
+_CACHE = {"at": 0.0, "body": b"", "ctype": "text/html; charset=utf-8"}
 TTL = 55
 
 def main_handler(event, context):
     now = time.time()
     if now - _CACHE["at"] > TTL or not _CACHE["body"]:
         resp = requests.get(
-            "https://rocokingdomworld.org/api/merchant",
-            headers={"Host": "rocokingdomworld.org",
+            SOURCE,
+            headers={"Host": "www.onebiji.com",
                      "User-Agent": "RocoMerchantMirror/1.0"},
             timeout=12,
         )
         resp.raise_for_status()
         _CACHE.update(at=now, body=resp.content,
-                      ctype=resp.headers.get("Content-Type", "application/json"))
+                      ctype=resp.headers.get("Content-Type", _CACHE["ctype"]))
     return {
         "isBase64Encoded": False,
         "statusCode": 200,
         "headers": {"Content-Type": _CACHE["ctype"],
                     "Cache-Control": "public, max-age=55"},
-        "body": _CACHE["body"].decode("utf-8"),
+        "body": _CACHE["body"].decode("utf-8", "replace"),
     }
 ```
 
-挂在 API 网关的自定义域名下，记得开启"集成响应"。
+挂在 API 网关的自定义域名下，记得开启"集成响应"。**原样返回 HTML 就行**——
+`cn_mirror` 会先试 JSON，失败后按页面规则解析。
 
 ## 在程序里启用
 
 1. 主界面 → 设置 → 数据渠道 → 选「**大陆反代 · 自建**」
-2. 接口地址填 `https://roco.example.cn/api/merchant`
+2. 接口地址填 `https://roco.example.cn/merchant`（即上面 Nginx 里 `location = /merchant`）
 3. 保存 → 主界面点「网络」按钮，看诊断面板：
 
 ```
@@ -133,8 +153,8 @@ def main_handler(event, context):
 
 ```yaml
 rules:
-  - DOMAIN-SUFFIX,rocokingdomworld.org,DIRECT
-  - DOMAIN,rocokingdomworld.org,DIRECT
+  - DOMAIN-SUFFIX,onebiji.com,DIRECT
+  - DOMAIN,onebiji.com,DIRECT
   - DOMAIN,doh.pub,DIRECT
   - IP-CIDR,1.12.12.12/32,DIRECT,no-resolve
   - IP-CIDR,120.53.53.53/32,DIRECT,no-resolve

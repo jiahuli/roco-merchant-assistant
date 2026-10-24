@@ -16,6 +16,7 @@ import re
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from typing import Any, Iterable
 
 import netdirect
@@ -223,6 +224,17 @@ def next_refresh_at(moment: datetime) -> datetime:
     return (moment + timedelta(days=1)).replace(hour=ROUND_HOURS[0], minute=0, second=0, microsecond=0)
 
 
+def round_start_at(moment: datetime) -> datetime:
+    """本轮开始时间（08/12/16/20 点）。
+
+    页面类渠道不返回 started_at，用它补上：通知去重按「轮次 + 商品」计键，
+    有个稳定的起点时间比留空更好排查。
+    """
+    index = round_index_at(moment)
+    hour = ROUND_HOURS[index - 1] if index else OPEN_HOUR
+    return moment.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
 def next_open_at(moment: datetime) -> datetime:
     """商人下次出现时间（打烊时段用）。"""
     if is_open_at(moment):
@@ -277,7 +289,7 @@ class BaseProvider:
         路由信息挂在 `self.route` 上，供界面显示"出口是否被代理接管"。
         """
         merged = {
-            "User-Agent": "RocoMerchantAssistant/1.4 (+desktop; direct-tls)",
+            "User-Agent": "RocoMerchantAssistant/1.6 (+desktop; direct-tls)",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
@@ -292,6 +304,29 @@ class BaseProvider:
             raise ProviderError(str(exc)) from exc
         self.route = trace
         return payload
+
+    def _request_text(self, url: str, headers: dict[str, str] | None = None,
+                      use_doh: bool = True) -> str:
+        """抓 HTML（页面即数据源的渠道用）。
+
+        与 `_request` 共用同一套直连 / DoH / 代理剥离逻辑，
+        只是不改 JSON 解析这一步。
+        """
+        merged = {
+            "User-Agent": "RocoMerchantAssistant/1.6 (+desktop; direct-tls)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        if headers:
+            merged.update(headers)
+        try:
+            body, trace = netdirect.fetch_bytes(
+                url, merged, timeout=self.timeout, use_doh=use_doh,
+            )
+        except netdirect.DirectError as exc:
+            raise ProviderError(str(exc)) from exc
+        self.route = trace
+        return body.decode("utf-8", errors="replace")
 
     def fetch(self) -> MerchantSnapshot:  # pragma: no cover - 由子类实现
         raise NotImplementedError
@@ -313,47 +348,194 @@ class OfficialProvider(BaseProvider):
 
 
 # ---------------------------------------------------------------------------
-# 社区镜像：字段最全
+# 中文社区数据：每日远行商人查询器（页面本身就是数据源）
 # ---------------------------------------------------------------------------
-class RkwProvider(BaseProvider):
-    id = "rkw"
-    default_label = "社区镜像 · 洛克王国世界 Wiki"
+_ONEBJJI_ITEM = re.compile(r'<li class="all_show[^>]*>.*?</li>', re.S)
+_ONEBJJI_CLASS = re.compile(r'class="([^"]*)"')
+_ONEBJJI_ROUND = re.compile(r"\bshow_([1-4])\b")
+_ONEBJJI_ARGS = re.compile(r"showShopinfo\((.*?)\)", re.S)
+_ONEBJJI_QUOTED = re.compile(r"'((?:[^'\\]|\\.)*)'")
+_ONEBJJI_NAME = re.compile(r'class="shop_name">\s*([^<]+?)\s*<')
+_ONEBJJI_PRICE = re.compile(r'class="shop_price">\s*价格[:：]\s*([0-9][0-9,]*)')
+_ONEBJJI_LIMIT = re.compile(r"<em>\s*限购\s*([0-9]+)\s*</em>")
+_ONEBJJI_IMG = re.compile(r'<div class="gitem"[^>]*>\s*<img[^>]+src="([^"]+)"')
+
+
+def parse_onebiji_html(page: str) -> list[MerchantItem]:
+    """把「每日远行商人查询器」的页面解析成商品列表（纯函数，可直接单测）。
+
+    2026-10 实测结构，每件商品是一个 `<li class="all_show ... show_1 show_3 ">`：
+
+    * 轮次就写在类名里（`show_N` → 第 N 轮），等价于接口的 `rounds` 字段；
+    * 名称 / 分类 / 描述在 `onclick="showShopinfo('<图标>','<名称>','<分类>','<描述>')"`；
+    * 价格在 `shop_price`（`价格：3000`），限购在 `<em>限购100</em>`，图标在 `<img src>`。
+
+    同一件商品可能按轮次拆成多条（例如神奇的蛋在第 1、3 轮各一条），
+    这里按名称合并 `rounds`，而不是像通用映射那样直接丢掉重名。
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for block in _ONEBJJI_ITEM.findall(page):
+        class_match = _ONEBJJI_CLASS.search(block)
+        rounds = tuple(sorted({
+            int(n) for n in _ONEBJJI_ROUND.findall(class_match.group(1) if class_match else "")
+        }))
+
+        args: list[str] = []
+        args_match = _ONEBJJI_ARGS.search(block)
+        if args_match:
+            args = [a.replace("\\'", "'").replace('\\"', '"').strip()
+                    for a in _ONEBJJI_QUOTED.findall(args_match.group(1))]
+
+        name = ""
+        name_match = _ONEBJJI_NAME.search(block)
+        if name_match:
+            name = name_match.group(1)
+        elif len(args) >= 2:
+            name = args[1]
+        name = unescape(name).strip()
+        if not name:
+            continue                      # 页面末尾有占位条目，没有名称
+
+        price_match = _ONEBJJI_PRICE.search(block)
+        limit_match = _ONEBJJI_LIMIT.search(block)
+        image_match = _ONEBJJI_IMG.search(block)
+        price = _to_int(price_match.group(1)) if price_match else None
+        limit = _to_int(limit_match.group(1)) if limit_match else None
+        image = image_match.group(1) if image_match else (args[0] if args else "")
+        if image.startswith("//"):
+            image = "https:" + image
+        category = unescape(args[2]).strip() if len(args) >= 3 else ""
+        description = unescape(args[3]).strip() if len(args) >= 4 else ""
+
+        current = merged.get(name)
+        if current is None:
+            merged[name] = {
+                "rounds": set(rounds), "price": price, "limit": limit,
+                "image": image, "category": category, "description": description,
+            }
+            order.append(name)
+            continue
+        current["rounds"].update(rounds)
+        for key, value in (("price", price), ("limit", limit),
+                           ("image", image), ("category", category),
+                           ("description", description)):
+            if not current[key] and value:
+                current[key] = value
+
+    items: list[MerchantItem] = []
+    for name in order:
+        data = merged[name]
+        items.append(
+            MerchantItem(
+                name=name,
+                price=data["price"],
+                limit=data["limit"],
+                icon_url=str(data["image"] or ""),
+                category=str(data["category"] or ""),
+                description=str(data["description"] or ""),
+                rounds=tuple(sorted(data["rounds"])),
+                rarity=infer_rarity(name, data["price"], str(data["category"] or "")),
+            )
+        )
+    return items
+
+
+def snapshot_from_items(items: list[MerchantItem], source_id: str, label: str,
+                        message: str = "") -> MerchantSnapshot:
+    """用"已经解析好的商品列表"拼快照（页面类渠道共用）。
+
+    页面不报 `status` / `expectedRound` / `nextRefresh`，一律按本地时间推算；
+    `expected_round` 与 `round_index` 取同一个值，因此不会误触发"轮次滞后"重试。
+    """
+    moment = now_cn()
+    round_index = round_index_at(moment)
+    kept, dropped = filter_by_round(items, round_index)
+    return MerchantSnapshot(
+        items=kept,
+        source_id=source_id,
+        source_label=label,
+        status=STATUS_OPEN if is_open_at(moment) else STATUS_CLOSED,
+        round_index=round_index,
+        expected_round=round_index,
+        started_at=round_start_at(moment).strftime("%Y-%m-%d %H:%M"),
+        next_refresh=next_refresh_at(moment).strftime("%Y-%m-%d %H:%M"),
+        fetched_at=moment,
+        dropped_count=len(dropped),
+        message=message,
+    )
+
+
+class OnebijiProvider(BaseProvider):
+    """中文社区数据：每日远行商人查询器。
+
+    页面本身就是数据源（没有 JSON API），因此用正则解析；站点一旦改版，
+    解析会得到空列表并抛错，让上层降级到下一个渠道——绝不把"没解析到"
+    当成"本轮没有商品"照常渲染。
+    """
+
+    id = "onebiji"
+    default_label = "社区数据 · 每日商人查询器（中文）"
+
+    def fetch(self) -> MerchantSnapshot:
+        page = self._request_text(self.base_url, {"Referer": "https://www.onebiji.com/"})
+        items = parse_onebiji_html(page)
+        if not items:
+            raise ProviderError("页面里没有解析到商品（站点可能改版或被网关拦截）")
+        return snapshot_from_items(items, self.id, self.label,
+                                   "数据解析自中文查询器页面，按轮次筛选")
+
+
+# ---------------------------------------------------------------------------
+# 哔哩哔哩 Wiki：只有商店目录，没有每轮货架
+# ---------------------------------------------------------------------------
+_BWIKI_ROW = re.compile(r"<tr[^>]*>.*?</tr>", re.S)
+_BWIKI_SHOP_NAME = re.compile(r'class="shopdex-shop-name">\s*([^<]+?)\s*<')
+_BWIKI_SHOP_COUNT = re.compile(r'class="shopdex-shop-count">\s*([0-9]+)\s*件')
+
+
+def parse_bwiki_shops(page: str) -> list[tuple[str, int]]:
+    """解析「商店一览」的商店行，返回 [(商店名, 商品数)]。
+
+    实测每个商店是一行 `<tr class="shopdex-shop-row">`，里面有
+    `shopdex-shop-name` 与 `shopdex-shop-count`；商品行与商店行在 DOM 上并不关联，
+    所以这里只能取到"目录里有没有远行商人、它挂了几件商品"。
+    """
+    shops: list[tuple[str, int]] = []
+    for row in _BWIKI_ROW.findall(page):
+        name_match = _BWIKI_SHOP_NAME.search(row)
+        if not name_match:
+            continue
+        count_match = _BWIKI_SHOP_COUNT.search(row)
+        shops.append((unescape(name_match.group(1)).strip(),
+                      int(count_match.group(1)) if count_match else 0))
+    return shops
+
+
+class BwikiProvider(BaseProvider):
+    """哔哩哔哩 BWIKI（可选渠道，默认不填地址）。
+
+    它只有「商店一览」目录：不列价格、没有轮次与刷新时间，商品行也不与商店归组。
+    因此本渠道**主动**给出明确错误，而不是返回一份看起来像货架的空/全量数据。
+    """
+
+    id = "bwiki"
+    default_label = "哔哩哔哩 Wiki · 商店目录（无货架）"
 
     def fetch(self) -> MerchantSnapshot:
         payload = self._request(self.base_url)
-        if not isinstance(payload, dict):
-            raise ProviderError("返回结构异常")
-
-        moment = now_cn()
-        # 接口自报的轮次优先；它落后于本地时间时说明上游还没换货
-        round_index = _to_int(payload.get("round") or payload.get("current_round")) \
-            or round_index_at(moment)
-        expected_round = _to_int(payload.get("expectedRound") or payload.get("expected_round")) \
-            or round_index_at(moment)
-
-        items, dropped = filter_by_round(build_items(_find_items(payload)), round_index)
-
-        status_raw = str(payload.get("status") or "").lower()
-        if status_raw in ("open", "closed"):
-            status = status_raw
-        else:
-            status = STATUS_OPEN if is_open_at(moment) else STATUS_CLOSED
-
-        next_refresh = _parse_dt(payload.get("nextRefreshBeijing") or payload.get("next_refresh_time"))
-        started = _parse_dt(payload.get("startedAtBeijing") or payload.get("refresh_time"))
-        return MerchantSnapshot(
-            items=items,
-            source_id=self.id,
-            source_label=self.label,
-            status=status,
-            expected_round=expected_round,
-            round_index=round_index,
-            started_at=started.strftime("%Y-%m-%d %H:%M") if started else None,
-            next_refresh=(next_refresh or next_refresh_at(moment)).strftime("%Y-%m-%d %H:%M"),
-            position=payload.get("position") or payload.get("merchant_pos"),
-            fetched_at=moment,
-            stale=bool(payload.get("stale")),
-            dropped_count=len(dropped),
+        page = ""
+        if isinstance(payload, dict):
+            page = str((payload.get("parse") or {}).get("text") or "")
+        if not page:
+            raise ProviderError("返回结构异常：不是 MediaWiki 的 parse 结果")
+        shops = parse_bwiki_shops(page)
+        hits = [(name, count) for name, count in shops if "远行商人" in name]
+        if not hits:
+            raise ProviderError("商店目录里没有「远行商人」，Wiki 结构可能已改版")
+        raise ProviderError(
+            f"BWIKI 只有商店目录（{hits[0][0]} · {hits[0][1]} 件商品），"
+            "不含价格 / 轮次 / 每轮货架，无法作为货架数据源；请改用中文查询器渠道"
         )
 
 
@@ -418,7 +600,18 @@ class CnMirrorProvider(BaseProvider):
     default_label = "大陆反代 · 自建"
 
     def fetch(self) -> MerchantSnapshot:
-        payload = self._request(self.base_url)
+        body = self._request_text(self.base_url)
+        # 反代目标有两种：JSON（聚合接口）与页面（中文查询器）。
+        # 先按 JSON 试，失败再按页面解析——两种都支持，配置才不用二选一。
+        try:
+            payload = json.loads(body.lstrip("\ufeff").strip())
+        except (json.JSONDecodeError, ValueError):
+            items = parse_onebiji_html(body)
+            if not items:
+                raise ProviderError(
+                    "反代返回的既不是 JSON、也解析不出页面商品（是否只转发了首页？）") from None
+            return snapshot_from_items(items, self.id, self.label,
+                                       "数据解析自反代页面，按轮次筛选")
         snapshot = snapshot_from_payload(payload, self.id, self.label)
         if not snapshot.items:
             raise ProviderError("未能从返回值里识别出商品列表（反代是否只转发了首页？）")
@@ -503,7 +696,8 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
 _REGISTRY: dict[str, type[BaseProvider]] = {
     "official": OfficialProvider,
     "cn_mirror": CnMirrorProvider,
-    "rkw": RkwProvider,
+    "onebiji": OnebijiProvider,
+    "bwiki": BwikiProvider,
     "yxsr": YxsrProvider,
     "shallow": ShallowProvider,
     "custom": CustomProvider,

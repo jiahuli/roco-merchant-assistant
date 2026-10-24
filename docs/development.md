@@ -11,29 +11,44 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 
 ---
 
-## 2. 数据源真相（先记住这四条，少走很多弯路）
+## 2. 数据源真相（先记住这五条，少走很多弯路）
 
 1. **没有官方 API**。腾讯/魔方未开放该接口，`providers.official` 只是预留位，地址为空时自动跳过。
-2. 默认渠道 `rkw` = `https://rocokingdomworld.org/api/merchant`，免费免 Key，字段最全。
-3. **各渠道实测归属**（2026-10 实测，用 `netdirect.diagnose()` 可复现）：
+2. **默认渠道 `onebiji`** = `https://www.onebiji.com/hykb_tools/comm/lkwgmerchant/preview.php?id=1&immgj=0`。
+   它是**页面而不是 JSON 接口**：页面直接列出今天 4 轮的全部商品，`providers.parse_onebiji_html()`
+   负责解析（纯正则，无第三方 HTML 库）。
+3. **1.6.0 下掉了旧的 `rkw`**（`rocokingdomworld.org`，英文界面 + 境外 Cloudflare + 下游缓存更厚）。
+   关键发现：`rkw` 返回体里的 `source` 字段指向的正是上面这个 `onebiji` 页面——它只是中间层。
+   直连数据源少一层中转，换货后更新更及时。老配置的 `provider: "rkw"` 会在 `Config.load()` 里
+   自动迁移到 `onebiji`，`providers.rkw` 条目也会被清掉。
+4. **各渠道实测归属**（2026-10 实测，用 `netdirect.diagnose()` 可复现）：
 
-   | 渠道 | 真实 IP | 大陆 | 延迟 | 备注 |
-   |---|---|---|---|---|
-   | `rkw` | `104.21.43.145` / `172.67.180.76`（Cloudflare） | 否 | 419–590ms | 默认 |
-   | `yxsr` | `64.29.17.195`（Vercel） | 否 | — | 仅商品名 |
-   | `shallow` | `124.226.74.51`（广西电信） | **是** | **140ms** | 需自备 Key |
-   | `cn_mirror` | 用户自建 | 是 | 取决于部署 | 见 `docs/cn-mirror.md` |
+   | 渠道 | 真实 IP / 归属 | 大陆 | 备注 |
+   |---|---|---|---|
+   | `onebiji` | 境内站点（`www.onebiji.com`） | **是** | 默认；页面解析，价格/限购/图标/轮次齐全 |
+   | `bwiki` | `171.108.215.21`（哔哩哔哩 BWIKI） | 是 | **只有商店目录**：不列价格、无轮次、商品不与商店归组；默认不填地址 |
+   | `yxsr` | `64.29.17.195`（Vercel） | 否 | 仅商品名；证书已变自签名，程序会拒绝 |
+   | `shallow` | `124.226.74.51`（广西电信） | **是** | 需自备 Key（401 未授权即不可用） |
+   | `cn_mirror` | 用户自建 | 是 | 见 `docs/cn-mirror.md` |
 
-4. **接口返回体关键字段**（`rkw`）：
+5. **`onebiji` 页面的数据结构**（`parse_onebiji_html()` 的解析依据）：
    ```
-   status         "open" | "closed"          （00:00–08:00 打烊）
-   round          当前轮次 1..4
-   expectedRound  按时间应处于第几轮         ← 与 round 不等 = 上游缓存未刷新
-   stale          上游自报是否过期
-   startedAtBeijing / nextRefreshBeijing     "YYYY-MM-DD HH:MM:SS"（北京时间）
-   items[]        当前货架                   每项含 name/price/limit/image/category/rounds
-   goods_list[]   与 items 同构（当前实现只读 items）
+   <li class="all_show li_show on show_1 show_2 show_3 show_4 "
+       onclick="showShopinfo('<图标>','<名称>','<分类>','<描述>')">
+     <div class="gitem"><img src="..."><em>限购100</em></div>
+     <div class="sp-text">
+       <em class="shop_name">网兜球</em>
+       <em class="shop_price">价格：3000 </em>
+     </div>
+   </li>
    ```
+   * `show_N` 类名 = 该商品在第 N 轮售卖（等价于接口的 `rounds`）：四个都有 → 全天在售。
+   * **同名商品会按轮次拆成多条**（如"神奇的蛋"在第 1、3 轮各一条），解析时按名称合并 `rounds`，
+     不能像通用 `build_items()` 那样按名称去重丢弃。
+   * 页面末尾有一条没有名称的占位 `<li>`，解析时跳过。
+   * 页面不返回 `status` / `expectedRound` / `nextRefresh`，这些一律用本地时间推算
+     （`is_open_at()` / `round_index_at()` / `next_refresh_at()`），因此 `expected_round == round_index`，
+     不会触发"轮次滞后"重试。
 
 ---
 
@@ -112,7 +127,7 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `models.py` | 120 | `MerchantItem`（含 `rounds` / `is_all_day`）、`MerchantSnapshot`（含 `is_round_lagging`） |
 | `numerals.py` | 80 | 数字 → 中文读法（`3200000` → 三百二十万），无依赖，易测 |
 | `rarity.py` | 109 | 珍惜度五档推断（关键词 → 分类 → 价格三层），官方数据无此字段 |
-| `providers.py` | 585 | 6 个渠道实现 + 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
+| `providers.py` | 660 | 7 个渠道实现（含页面解析）+ 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
 | `freshness.py` | 409 | 货架新鲜度判定（轮次落后 / 只剩全天商品 / 本轮商品消失），纯状态机，不碰 Tk |
 | `netdirect.py` | 589 | 直连网络层：剥代理 / DoH / 按 IP 直连 / CN 段判定 / 出口诊断 / Clash 规则生成 |
 | `cache.py` | 275 | 图标两级缓存（磁盘 `sha1(url).png` + 内存 `PhotoImage`）+ 目录迁移 |
@@ -167,12 +182,15 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 scheduler 到点 / 用户点刷新
   → MerchantApp.refresh()                     （_loading 防重入，重试计数归零）
   → 线程池 fetch_snapshot(config)
-      → 按 provider 顺序试：official → cn_mirror → rkw → yxsr → shallow → custom
-      → BaseProvider._request()  →  netdirect.fetch_json()
+      → 按 provider 顺序试：official → cn_mirror → onebiji → bwiki → yxsr → shallow → custom
+      → BaseProvider._request() / _request_text()
+            → netdirect.fetch_json() / fetch_bytes()
             → DoH 取真实 IP（绕 fake-ip）→ 按 IP 建 TLS 连接（SNI 保持域名）
-      → RkwProvider.fetch() 解析 status/round/expectedRound/items
-            → build_items() 解析 rounds
+      → OnebijiProvider.fetch()  抓页面 → parse_onebiji_html()
+            → 解析 show_N 类名得到 rounds、合并同名多轮
             → filter_by_round() 剔除明确不属于本轮的条目
+      → CnMirrorProvider.fetch() 先试 JSON，失败则按同一套页面解析
+      → 通用 JSON 渠道：snapshot_from_payload() → build_items() 解析 rounds
       → verify_egress 时附一次 /cdn-cgi/trace 结果
   → 回主线程 _on_fetched()
       → _render()            卡片 + 统计 + 滞后提示
