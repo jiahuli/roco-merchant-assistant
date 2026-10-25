@@ -18,6 +18,7 @@ from roco import applog
 from roco.platform import autostart
 from roco.core import history
 from roco.platform import monitors
+from roco.platform import display
 from roco.net import netdirect
 from roco.core import purchases
 from roco.platform import tray as tray_module
@@ -37,9 +38,10 @@ from roco.ui.app_controller import AppController
 from roco.ui.floating_window import FloatingWindow
 from roco.ui.history_panel import HistoryPanel
 from roco.ui.settings_dialog import SettingsDialog
-from roco.ui import theme
+from roco.ui import motion, theme
 from roco.ui.theme import mono_font, ui_font
 from roco.ui.widgets import ItemCard, PillButton, ScrollFrame, StatBlock, StatusPill
+
 
 
 class MerchantApp:
@@ -93,6 +95,7 @@ class MerchantApp:
         self._history_expanded = False
         self._columns = 0
         self._resize_job: str | None = None
+        self._entrance_jobs: list[str] = []
         self._countdown_target: datetime | None = None
 
         self._setup_window()
@@ -102,6 +105,7 @@ class MerchantApp:
         applog.info("主窗口就绪 | 显示器 %s 块 | 渠道 %s | 定时 %s",
                     len(monitors.enum_monitors()), config.provider,
                     ",".join(config.query_times))
+        applog.info("帧节拍 | %s", display.describe())
         applog.info("直连状态 | 代理剥离=%s | DoH=%s | 大陆 IP 段=%s 条 | 环境代理变量=%s",
                     "开" if config.force_direct else "关",
                     "开" if config.doh_enabled else "关",
@@ -265,8 +269,11 @@ class MerchantApp:
                 self.root.iconbitmap(default=str(icon_file))
             except tk.TclError:
                 pass
-        # Win11 质感：双缓冲防撕裂 + 圆角/系统阴影 + 标题栏明暗 + Mica（尽力而为，
-        # Win10 上静默跳过）；主题切换后 _rebuild_for_theme 会带新明暗再调一次
+        # Win11 质感：圆角/系统阴影 + 标题栏明暗 + Mica（尽力而为，Win10 上静默跳过）；
+        # 主题切换后 _rebuild_for_theme 会带新明暗再调一次。
+        # ⚠️ 这里**没有**双缓冲：WS_EX_COMPOSITED 对可见窗口 + Tk update() 是死锁组合
+        # （见 roco/platform/win11_style.py 模块注释）。防撕裂靠"拖动交给系统移动循环"
+        # + 动画只在 item 层更新，不靠窗口样式。
         win11_style.style_toplevel(
             self.root, dark=theme.resolve_mode(self.config.theme_mode) != "light", mica=True)
         try:
@@ -706,6 +713,9 @@ class MerchantApp:
     # ------------------------------------------------------------------ 渲染
     def _reset_content(self) -> None:
         """清空内容区；货架容器按需重建（clear() 会连它一起销毁）。"""
+        # 入场动画是"逐个 grid"的延时任务：不先撤掉，它们会落到已销毁的卡片上，
+        # 抛出的 TclError 被 Tk 吞掉，表现成"界面出错"或界面停住不动
+        self._cancel_entrance()
         self._scroll.clear()
         self._cards.clear()
         self._bought_cards.clear()
@@ -840,22 +850,53 @@ class MerchantApp:
         self._sync_tray_tooltip()
 
     # ------------------------------------------------------- 分区 / 历史
+    def _cancel_entrance(self) -> None:
+        """撤掉还没触发的入场显现任务（重绘/退出前必须调）。"""
+        jobs, self._entrance_jobs = self._entrance_jobs, []
+        for job in jobs:
+            try:
+                self.root.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+
+
     def _animate_entrance(self) -> None:
-        """卡片瀑布式入场：先全部藏起，再按 12ms/张依次显现。
+        """卡片瀑布式入场：先全部藏起，再按帧节拍依次显现。
 
         Tk 做不了逐控件透明度，但这种"有节奏的显现"把一次生硬的
         整屏替换变成了平滑过渡。只在取数驱动的渲染时启用（默认关），
         勾选已购等重绘保持瞬时，避免每次点击都闪一遍。
+
+        步长跟随帧节拍（`motion.frame_ms()`），总时长仍控制在 240ms 左右：
+        原来写死 12–24ms/张，既与屏幕无关，任务也不可撤销——重绘时
+        会去 grid 已经销毁的卡片。
         """
         cards = [c for c in (*self._cards, *self._bought_cards)
                  if c.winfo_exists()]
         if len(cards) < 2:
             return
+        self._cancel_entrance()
         for card in cards:
             card.grid_remove()
-        interval = max(10, min(24, 240 // len(cards)))
+        interval = max(motion.frame_ms(), min(24, 240 // len(cards)))
+
+        def reveal(card) -> None:
+            try:
+                if card.winfo_exists():
+                    card.grid()
+            except tk.TclError:
+                pass
+
         for index, card in enumerate(cards):
-            self.root.after(index * interval, card.grid)
+            try:
+                self._entrance_jobs.append(self.root.after(index * interval, reveal, card))
+            except tk.TclError:
+                return
+        try:
+            self._entrance_jobs.append(
+                self.root.after(len(cards) * interval + 20, self._cancel_entrance))
+        except tk.TclError:
+            pass
 
     def _ensure_bought_grid(self) -> tk.Frame:
         """「已购买」独立区域：与在售区分开，避免已买的还占着最显眼的位置。"""
@@ -1289,7 +1330,14 @@ class MerchantApp:
             self.root.lift()
             self.root.focus_force()
             self.root.attributes("-topmost", True)
-            self.root.after(320, lambda: self.root.attributes("-topmost", False))
+            self.root.after(320, self._drop_topmost)
+        except tk.TclError:
+            pass
+
+    def _drop_topmost(self) -> None:
+        """临时置顶的收尾；窗口已销毁时静默跳过（否则会落进 Tk 错误钩子）。"""
+        try:
+            self.root.attributes("-topmost", False)
         except tk.TclError:
             pass
 
@@ -1334,6 +1382,7 @@ class MerchantApp:
         if self._quitting:
             return
         applog.info("程序退出")
+        self._cancel_entrance()
         self.controller.cancel_retry()
         self._theme_listener.stop()
         if self._pump_job is not None:

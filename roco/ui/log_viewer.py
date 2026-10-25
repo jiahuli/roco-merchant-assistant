@@ -9,12 +9,16 @@ from typing import Optional
 from roco import applog
 from roco.ui import theme
 from roco.platform import win11_style
-from roco.ui.theme import round_rect, ui_font
+from roco.ui.theme import round_rect_points, ui_font
 from roco.ui.widgets import PillButton
 
 
 class _SlimScrollbar(tk.Canvas):
-    """细滚动条：绑定到 Text 的 yview，配色跟主界面一致。"""
+    """细滚动条：绑定到 Text 的 yview，配色跟主界面一致。
+
+    拇指是一个**常驻 item**（`coords` 移动），不是每帧 delete("all") 重画：
+    后者会先擦成底色，拖着滚动条时每一帧都能看见闪。
+    """
 
     def __init__(self, master: tk.Misc, target: tk.Text, bg: str = theme.SURFACE) -> None:
         super().__init__(master, width=10, bg=bg, highlightthickness=0, bd=0)
@@ -22,6 +26,9 @@ class _SlimScrollbar(tk.Canvas):
         self._first, self._last = 0.0, 1.0
         self._drag_origin = 0
         self._drag_top = 0.0
+        self._signature = None
+        self._thumb = self.create_polygon(0, 0, 0, 0, smooth=True, outline="",
+                                          fill=theme.SURFACE_3, state="hidden")
         self.bind("<Button-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
         self.bind("<Configure>", lambda _e: self.redraw())
@@ -31,15 +38,26 @@ class _SlimScrollbar(tk.Canvas):
         self.redraw()
 
     def redraw(self) -> None:
-        self.delete("all")
         height = self.winfo_height()
+        signature = (round(self._first, 3), round(self._last, 3), height)
+        if signature == self._signature:
+            return
+        self._signature = signature
         if height <= 1 or self._last - self._first >= 0.999:
+            try:
+                self.itemconfigure(self._thumb, state="hidden")
+            except tk.TclError:
+                pass
             return
         top = max(0.0, self._first * height)
         bottom = min(float(height), self._last * height)
         if bottom - top < 24:
             bottom = top + 24
-        round_rect(self, 2, top + 2, 8, bottom - 2, 3, fill=theme.SURFACE_3, outline="", width=0)
+        try:
+            self.coords(self._thumb, *round_rect_points(2, top + 2, 8, bottom - 2, 3))
+            self.itemconfigure(self._thumb, state="normal")
+        except tk.TclError:
+            return
 
     def _on_press(self, event) -> None:
         height = self.winfo_height() or 1
@@ -150,11 +168,13 @@ class LogViewer(tk.Toplevel):
         self.text.delete("1.0", "end")
         if content.strip():
             self.text.insert("1.0", content)
-            # 简单着色：ERROR / theme.WARNING 行
+            # 简单着色：ERROR / WARNING 行。注意这里比对的是**日志级别文本**，
+            # 不是主题色常量——1.9 的主题重构把 " WARNING " 误替换成
+            # " theme.WARNING "，导致警告行再也没被高亮过
             for index, line in enumerate(content.splitlines(), start=1):
                 if " ERROR " in line:
                     self.text.tag_add("error", f"{index}.0", f"{index}.end")
-                elif " theme.WARNING " in line:
+                elif " WARNING " in line:
                     self.text.tag_add("warning", f"{index}.0", f"{index}.end")
         else:
             self.text.insert("1.0", "（暂无日志）\n\n出现异常时，这里会记录完整堆栈。")

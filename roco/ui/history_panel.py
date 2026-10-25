@@ -21,9 +21,16 @@ from typing import Callable, Iterable, Optional
 
 from roco.services.cache import ImageLoader
 from roco.core.history import HistoryRound
-from roco.ui import theme
+from roco.platform import winpaint
+from roco.ui import motion, theme
 from roco.ui.theme import ui_font
 from roco.ui.widgets import ItemCard, PillButton
+
+# 两轮之间的间隔：**至少一帧**。间隔太小（如 after(1)）等于没让出帧——
+# 整条链会在同一次 update() 里跑完，画面还是一起出现；给足一帧，新的一轮
+# 才会真正被合成上屏，观感是"一轮一轮滑入"。
+def _build_gap_ms() -> int:
+    return max(16, motion.frame_ms() * 2)
 
 
 class HistoryPanel(tk.Frame):
@@ -40,6 +47,10 @@ class HistoryPanel(tk.Frame):
         # 重绘时 constructor 会先于数据到达，先记住"用户想展开"，等数据来了再展开
         self._want_expanded = bool(expanded)
         self._on_toggle = on_toggle
+        # 逐轮构建：一次只建一轮，建完就让事件循环把这一轮画出来
+        self._build_job: Optional[str] = None
+        self._build_index = 0
+        self.bind("<Destroy>", lambda _e: self._cancel_build(), add="+")
 
         self.header = tk.Frame(self, bg=theme.BG, cursor="hand2")
         self.header.pack(fill="x", padx=26, pady=(6, 2))
@@ -102,12 +113,18 @@ class HistoryPanel(tk.Frame):
         self._arrow.configure(text="▾" if self._expanded else "▸")
         self._toggle_btn.set_text("收起历史" if self._expanded else "展开历史")
         if self._expanded:
-            self._body.pack(fill="x", padx=20, pady=(2, 0))
-            self._rebuild()
+            # 展开：容器先挂上（不能让它空着闪一下），第一轮同步建好就上屏，
+            # 后续轮次由 _build_chunk 按轮续建 —— 用户 ~90ms 内就能看到内容，
+            # 而不是先盯着 300ms 的静止画面。
+            with winpaint.frozen_redraw(self):
+                self._body.pack(fill="x", padx=20, pady=(2, 0))
+                self._rebuild()
         else:
+            self._cancel_build()
             self._body.pack_forget()
 
     def _collapse(self) -> None:
+        self._cancel_build()
         self._expanded = False
         self._want_expanded = False
         self._arrow.configure(text="▸")
@@ -117,17 +134,62 @@ class HistoryPanel(tk.Frame):
 
     # ------------------------------------------------------------------
     def _rebuild(self) -> None:
+        """重建历史列表：逐轮构建，一轮建完立刻上屏。
+
+        为什么不再"一次全建完再显示"：本机 Tk 的布局成本约 1.4ms/控件，一轮
+        （5 张卡片 ≈ 65 个控件）≈ 90ms，四轮就是 360ms。整块憋着建，用户要
+        盯 300–400ms 的静止画面（"点了没反应"）；逐轮构建则是**第一轮 ~90ms
+        就到**，后面的轮次以同样的节奏依次滑入，总时长不变但反馈立刻可见。
+
+        每一轮内部仍然冻结重绘（`winpaint.frozen_redraw`）：一轮的卡片、文字、
+        图标必须同时出现，不能出现"空白卡片先出来、再填字、再补图标"。
+        """
+        self._cancel_build()
+        # 图标必须**在**建卡片之前全部解码进内存：否则每张卡片在构建期各触发一次
+        # 磁盘解码，图标就会晚一拍（还在下载的由结果泵补齐，同样不丢）
+        if self._loader is not None:
+            self._loader.prewarm([item.icon_url for round_ in self._rounds
+                                  for item in round_.items])
         for child in self._body.winfo_children():
             child.destroy()
         if not self._rounds:
             tk.Label(self._body, text="还没有历史记录，查询成功一轮后就会出现。",
                      bg=theme.BG, fg=theme.MUTED, font=ui_font(9), anchor="w").pack(fill="x", pady=10)
             return
+        self._build_index = 0
+        self._build_chunk()
 
-        for index, round_ in enumerate(self._rounds):
-            if index:
-                tk.Frame(self._body, bg=theme.BORDER, height=1).pack(fill="x", padx=6, pady=(10, 0))
-            self._build_round(round_, is_current=(index == 0))
+    def _build_chunk(self) -> None:
+        """建一轮（含它与上一轮之间的分隔线），然后让出一帧。"""
+        self._build_job = None
+        try:
+            if not self.winfo_exists():
+                return
+            index = self._build_index
+            if index >= len(self._rounds):
+                return
+            with winpaint.frozen_redraw(self):
+                if index:
+                    tk.Frame(self._body, bg=theme.BORDER, height=1).pack(
+                        fill="x", padx=6, pady=(10, 0))
+                self._build_round(self._rounds[index], is_current=(index == 0))
+                self.update_idletasks()      # 这一轮的几何一次算完，解冻即完整上屏
+            self._build_index = index + 1
+            if self._build_index < len(self._rounds):
+                # 间隔只是"把已建好的这轮画出来"的机会，不额外拖延
+                self._build_job = self.after(_build_gap_ms(), self._build_chunk)
+        except tk.TclError:                  # 面板已销毁 / 收起
+            self._build_job = None
+
+    def _cancel_build(self) -> None:
+        """停掉还没建完的轮次（收起、重绘、销毁时必须调）。"""
+        if self._build_job is not None:
+            try:
+                self.after_cancel(self._build_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._build_job = None
+        self._build_index = 0
 
     def _build_round(self, round_: HistoryRound, is_current: bool) -> None:
         # 标题行：与主界面「本轮货架」的排版保持一致（左标题、右计数）
@@ -160,17 +222,39 @@ class HistoryPanel(tk.Frame):
         cards = [ItemCard(grid, item, self._loader, index)
                  for index, item in enumerate(round_.items)]
 
-        def relayout(_event=None) -> None:
-            width = grid.winfo_width() or 1100
-            columns = max(1, min(4, (width - 20) // 340))
-            for column in range(5):
-                grid.columnconfigure(
-                    column, weight=1 if column < columns else 0,
-                    uniform="hist" if column < columns else "",
-                )
-            for index, card in enumerate(cards):
-                card.grid(row=index // columns, column=index % columns,
-                          sticky="nsew", padx=6, pady=6)
+        # 列数没变就不重排。旧实现在每个 <Configure> 上都把所有卡片重新 grid 一遍：
+        # 展开历史后拖窗口边缘，事件按输入频率到来，几十张卡每帧重排 → 掉帧且抖。
+        state: dict = {"columns": 0, "job": None}
 
+        def apply_layout() -> None:
+            state["job"] = None
+            try:
+                if not grid.winfo_exists():
+                    return
+                width = grid.winfo_width() or 1100
+                columns = max(1, min(4, (width - 20) // 340))
+                if columns == state["columns"]:
+                    return
+                state["columns"] = columns
+                for column in range(5):
+                    grid.columnconfigure(
+                        column, weight=1 if column < columns else 0,
+                        uniform="hist" if column < columns else "",
+                    )
+                for index, card in enumerate(cards):
+                    card.grid(row=index // columns, column=index % columns,
+                              sticky="nsew", padx=6, pady=6)
+            except tk.TclError:
+                return
+
+        def relayout(_event=None) -> None:
+            # 攒到空闲时算一次：一轮事件里只重排一次，宽度仍取最新值
+            if state["job"] is not None:
+                return
+            try:
+                state["job"] = grid.after_idle(apply_layout)
+            except tk.TclError:
+                state["job"] = None
+
+        apply_layout()
         grid.bind("<Configure>", relayout)
-        relayout()

@@ -225,12 +225,15 @@ def mono_font(size: int = 22, weight: str = "bold") -> tuple:
 
 
 # ---------------- 绘制工具 ----------------
-def round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
-               radius: float, **kwargs) -> int:
-    """在 Canvas 上画圆角矩形（用平滑多边形逼近，边缘干净）。"""
-    radius = max(0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
-    if radius <= 0:
-        return canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
+def round_rect_points(x1: float, y1: float, x2: float, y2: float,
+                      radius: float, step: int = 10) -> list[float]:
+    """圆角矩形的顶点序列（平滑多边形用）。
+
+    单独拆出来是为了让"同一形状反复变位置"的动画（滚动条拇指）能用
+    `canvas.coords(item, *points)` 原地更新，而不是 delete("all") 后重建——
+    重建会先擦成底色，高刷屏上每一帧都能看见那一下闪。
+    """
+    radius = max(0.0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
     points: list[float] = []
     corners = (
         (x2 - radius, y1 + radius, -90),
@@ -239,10 +242,20 @@ def round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
         (x1 + radius, y1 + radius, 180),
     )
     for cx, cy, start in corners:
-        for step in range(0, 91, 10):
-            angle = math.radians(start + step)
+        for offset in range(0, 91, step):
+            angle = math.radians(start + offset)
             points.extend((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
-    return canvas.create_polygon(points, smooth=True, **kwargs)
+    return points
+
+
+def round_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
+               radius: float, **kwargs) -> int:
+    """在 Canvas 上画圆角矩形（用平滑多边形逼近，边缘干净）。"""
+    radius = max(0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    if radius <= 0:
+        return canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
+    return canvas.create_polygon(round_rect_points(x1, y1, x2, y2, radius),
+                                 smooth=True, **kwargs)
 
 
 def lighten(color: str, amount: float = 0.12) -> str:

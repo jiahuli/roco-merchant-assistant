@@ -1,4 +1,5 @@
 """功能自测：核心逻辑 + 关键交互。"""
+import importlib
 import json
 import os
 import sys
@@ -10,6 +11,48 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tkinter as tk
 
 from contextlib import contextmanager
+
+
+@contextmanager
+def frozen_clock(hour: int = 20, minute: int = 30):
+    """把"现在"钉在营业时段内，避免自测结果随时间漂移。
+
+    一批渲染 / 货架 / 换货校验用例隐含假设"商人正在营业"（入口是
+    `is_open_at(datetime.now(CN_TZ))`）。原来在 00:00–08:00 跑，这批用例
+    会全线失败（"初始两件都在在售区 → 0/0"），看着像回归，实际是打烊。
+
+    这里只替换相关模块里的 `datetime`，**不改任何断言**；真正的打烊逻辑
+    由 `test_midnight_shelf`、`test_render_states` 用显式快照覆盖，不受影响。
+    """
+    import datetime as _dt
+
+    fixed = _dt.datetime(2026, 10, 25, hour, minute, 0)
+
+    class _Frozen(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.replace(tzinfo=tz) if tz is not None else fixed
+
+        @classmethod
+        def utcnow(cls):
+            return fixed
+
+    patched = []
+    for name in ("roco.ui.app_window", "roco.core.rounds", "roco.core.freshness",
+                 "roco.net.providers", "roco.net.parsing", "roco.core.history",
+                 "roco.core.purchases", "roco.ui.history_panel"):
+        try:
+            module = importlib.import_module(name)
+        except Exception:      # noqa: BLE001 - 缺模块不该让自测起不来
+            continue
+        if hasattr(module, "datetime"):
+            patched.append((module, module.datetime))
+            module.datetime = _Frozen
+    try:
+        yield
+    finally:
+        for module, original in patched:
+            module.datetime = original
 
 from roco.platform import autostart
 from roco.config import Config, config_path, sanitize_times, state_path
@@ -2192,8 +2235,430 @@ def test_close_to_tray_switch():
     app.quit_app()
 
 
+def test_frame_pacing():
+    """帧节拍：刷新率夹取、定时器精度引用计数、动画可取消且销毁安全。"""
+    from roco.platform import display
+    from roco.ui import motion
+
+    frame = display.frame_ms()
+    check("帧间隔不超过 90fps", frame >= int(1000 / 90), f"frame_ms={frame}")
+    check("帧间隔不超过 16ms（低刷屏不更慢）", frame <= 16, f"frame_ms={frame}")
+    check("帧节拍描述含刷新率", "Hz" in display.describe(), display.describe())
+
+    # 引用计数：成对持有/归还后不能残留（残留会让系统长期保持 1ms 定时器精度）
+    display.hold_precise_timer()
+    display.hold_precise_timer()
+    display.release_precise_timer()
+    display.release_precise_timer()
+    check("定时器精度成对归还", not display.precise_timer_held())
+    display.release_precise_timer()
+    check("多余归还不出负数", not display.precise_timer_held())
+
+    root = tk.Tk()
+    root.withdraw()
+    canvas = tk.Canvas(root, width=20, height=20)
+    anim = motion.Animation(canvas)
+    seen: list = []
+    done: list = []
+    anim.tween(120, 0.0, 1.0, seen.append, on_done=lambda: done.append(True))
+    deadline = time.time() + 3
+    while anim.running and time.time() < deadline:
+        root.update()
+        time.sleep(0.004)
+    root.update()
+    check("补间跑到终点", bool(done) and seen and abs(seen[-1] - 1.0) < 1e-6, f"{seen[-3:]}")
+    check("补间进度单调不减", all(b >= a for a, b in zip(seen, seen[1:])))
+    check("补间结束归还定时器精度", not display.precise_timer_held())
+
+    # 动画途中销毁控件：异常会被 Tk 吞掉，表现成"界面卡住"，所以必须自动停表
+    doomed = tk.Canvas(root, width=20, height=20)
+    anim2 = motion.Animation(doomed)
+    anim2.tween(400, 0.0, 1.0, lambda _v: None)
+    doomed.destroy()
+    boom = None
+    try:
+        for _ in range(20):
+            root.update()
+            time.sleep(0.004)
+    except tk.TclError as exc:      # noqa: PERF203 - 这里就是要捕获
+        boom = exc
+    check("控件销毁后动画自动停表", boom is None and not anim2.running, str(boom))
+
+    ticker = motion.Ticker(root)
+    frames: list = []
+
+    def step(dt: float) -> bool:
+        frames.append(dt)
+        return len(frames) < 3
+
+    ticker.start(step)
+    deadline = time.time() + 3
+    while ticker.running and time.time() < deadline:
+        root.update()
+        time.sleep(0.004)
+    check("连续节拍按 step 返回值停止", len(frames) >= 3, f"{len(frames)} 帧")
+    check("连续节拍带真实 dt", all(dt >= 0 for dt in frames), str(frames[:3]))
+    root.destroy()
+
+
+def test_widget_items_reuse():
+    """动画不重建 Canvas item：按钮 / 状态胶囊 / 滚动条拇指都只改属性。"""
+    from roco.ui import theme
+    from roco.ui.widgets import ItemCard, PillButton, ScrollFrame, StatusPill
+
+    class _NullLoader:
+        def load(self, *args, **kwargs):
+            return None
+
+        def prewarm(self, *args, **kwargs):
+            return None
+
+    theme.apply("dark", "")
+    root = tk.Tk()
+    root.geometry("900x600+120+120")
+
+    button = PillButton(root, "测试按钮", style="primary")
+    button.pack(pady=4)
+    root.update()
+    ids = button.find_all()
+    button._hover = True
+    button._on_enter()
+    for _ in range(16):
+        root.update()
+        time.sleep(0.004)
+    check("按钮重绘复用 item", len(ids) == 2 and button.find_all() == ids, f"{ids}")
+    check("悬停后确实改了填充色",
+          button.itemcget(button._shape, "fill") != theme.SURFACE_2,
+          button.itemcget(button._shape, "fill"))
+
+    pill = StatusPill(root)
+    pill.pack(pady=4)
+    root.update()
+    width_before, pill_ids = int(pill["width"]), pill.find_all()
+    pill.set_state("换货校验中", theme.WARNING)
+    root.update()
+    pill.set_state("已打烊", theme.MUTED)
+    root.update()
+    check("状态胶囊宽度固定", int(pill["width"]) == width_before, f"{width_before}")
+    check("状态胶囊复用 item", pill.find_all() == pill_ids, f"{pill_ids}")
+    check("状态胶囊文案已更新", pill.itemcget(pill._label, "text") == "已打烊")
+
+    scroll = ScrollFrame(root, bg=theme.BG)
+    scroll.pack(fill="both", expand=True)
+    for index in range(12):
+        ItemCard(
+            scroll.body,
+            MerchantItem(name=f"道具{index}", price=1000 * (index + 1), limit=1,
+                         category="材料", description="测试", rounds=(1, 2, 3, 4)),
+            _NullLoader(),
+        ).pack(fill="x")
+    root.update()
+    thumb = scroll._thumb
+    scroll.canvas.yview_moveto(0.5)
+    root.update()
+    scroll.canvas.yview_moveto(0.8)
+    root.update()
+    check("滚动条拇指复用同一 item",
+          scroll._thumb == thumb and len(scroll.bar.find_all()) == 1)
+    check("滚动条拇指可见", scroll.bar.itemcget(thumb, "state") == "normal",
+          scroll.bar.itemcget(thumb, "state"))
+    root.destroy()
+
+
+def test_floating_drag_contract():
+    """悬浮窗拖动：程序化入口语义不变、阈值内不搬窗、回落后仍可拖、位置落盘。"""
+    from roco.platform import monitors, window_move
+    from roco.ui.floating_window import FloatingWindow
+
+    config = Config()
+    config.floating_geometry = ""
+    root = tk.Tk()
+    root.withdraw()
+    window = FloatingWindow(root, config)
+    window.update()
+
+    check("拖动阈值来自系统且非零", window_move.drag_threshold() >= 2,
+          str(window_move.drag_threshold()))
+
+    class _Event:
+        def __init__(self, x: int, y: int) -> None:
+            self.x_root = x
+            self.y_root = y
+
+    # 1) 程序化调用（自测与回落路径共用）：必须仍然按偏移搬窗口
+    window._monitors = monitors.enum_monitors()
+    window._drag_offset = (0, 0)
+    window._last_pos = None
+    window._drag_move(_Event(60, 40))
+    window._drag_end()
+    window.update()
+    check("程序化 _drag_move 仍然生效",
+          (window.winfo_x(), window.winfo_y()) == (60, 40),
+          f"{(window.winfo_x(), window.winfo_y())}")
+
+    # 2) 阈值内的微小抖动不搬窗口：标题栏的单击/双击必须照旧
+    window._system_broken = True          # 强制走应用内路径，别真弹系统移动循环
+    window._drag_start(_Event(60, 40))
+    window._drag_move(_Event(62, 41))
+    window.update()
+    check("阈值内抖动不搬窗口", (window.winfo_x(), window.winfo_y()) == (60, 40),
+          f"{(window.winfo_x(), window.winfo_y())}")
+    window._drag_end()
+
+    # 3) 超过阈值后应用内拖动仍然有效（系统路径不可用时就是靠它）
+    window._drag_start(_Event(60, 40))
+    window._drag_move(_Event(200, 150))
+    window._drag_end()
+    window.update()
+    check("回落后仍可拖动", (window.winfo_x(), window.winfo_y()) == (200, 150),
+          f"{(window.winfo_x(), window.winfo_y())}")
+    check("拖动结束写入几何", config.floating_geometry.endswith("+200+150"),
+          config.floating_geometry)
+
+    # 4) 拖动中改尺寸先记账，松手再应用（否则窗口会被拽走）
+    window._press_root = (10, 10)
+    window._pending_size = None
+    window._apply_size(150)
+    check("拖动中改尺寸先记账", window._pending_size == 150, str(window._pending_size))
+    window._press_root = None
+    window._drag_offset = None
+    window._finish_drag()
+    window.update()
+    check("松手后应用推迟的尺寸", window.winfo_height() == 150, str(window.winfo_height()))
+
+    window.destroy()
+    root.destroy()
+
+
+def test_log_viewer_highlight():
+    """日志查看器：ERROR 与 WARNING 行都要着色（1.9 把 WARNING 字面量误替换过）。"""
+    from roco import applog
+    from roco.ui import theme
+    from roco.ui.log_viewer import LogViewer
+
+    content = (
+        "2026-10-25 21:00:00 INFO 一切正常\n"
+        "2026-10-25 21:00:01 ERROR 出错了\n"
+        "2026-10-25 21:00:02 WARNING 注意一下\n"
+    )
+    original = applog.tail
+    applog.tail = lambda max_lines=600, errors_only=False: content   # noqa: ARG005
+    theme.apply("dark", "")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        viewer = LogViewer(root)
+        viewer.update()
+        check("日志 ERROR 行着色", bool(viewer.text.tag_ranges("error")))
+        check("日志 WARNING 行着色", bool(viewer.text.tag_ranges("warning")))
+        viewer.destroy()
+    finally:
+        applog.tail = original
+        root.destroy()
+
+
+def test_scroll_pacing():
+    """快速滑动：拇指拖动每帧只搬一次；帧超预算时自动降速（帧同步闭环）。"""
+    from roco.ui import theme
+    from roco.ui.widgets import ItemCard, ScrollFrame
+
+    class _NullLoader:
+        def load(self, *args, **kwargs):
+            return None
+
+        def prewarm(self, *args, **kwargs):
+            return None
+
+    class _Ev:
+        def __init__(self, y: int) -> None:
+            self.y = y
+
+    theme.apply("dark", "")
+    root = tk.Tk()
+    root.geometry("900x600+160+160")
+    scroll = ScrollFrame(root, bg=theme.BG)
+    scroll.pack(fill="both", expand=True)
+    for index in range(24):
+        ItemCard(
+            scroll.body,
+            MerchantItem(name=f"道具{index}", price=1000 * (index + 1), limit=1,
+                         category="材料", description="测试", rounds=(1, 2, 3, 4)),
+            _NullLoader(),
+        ).pack(fill="x")
+    for _ in range(8):
+        root.update()
+        time.sleep(0.01)
+
+    moves = {"n": 0}
+    original = scroll.canvas.yview_moveto
+
+    def counting(value):
+        moves["n"] += 1
+        return original(value)
+
+    scroll.canvas.yview_moveto = counting
+    try:
+        scroll._on_bar_press(_Ev(0))
+        for step in range(12):        # 模拟 1000Hz 鼠标一帧内送来的十几个事件
+            scroll._on_bar_drag(_Ev(step * 4))
+        scroll._on_bar_release()
+        root.update()
+        # 一帧内最多两次：节拍启动时的一次 + 本帧推进一步
+        check("拇指拖动每帧只搬一次", moves["n"] <= 2, f"{moves['n']} 次")
+    finally:
+        scroll.canvas.yview_moveto = original
+        scroll._cancel_scroll_anim()
+
+    pace_before = scroll._pace
+    for _ in range(3):
+        scroll._adapt_pace(0.060)      # 帧被拖长到 60ms（预算才 11ms）
+    check("帧超预算时自动降速", scroll._pace < pace_before, f"{scroll._pace:.2f}")
+    for _ in range(12):
+        scroll._adapt_pace(0.004)      # 帧回到预算内
+    check("回到预算内后恢复速度", scroll._pace > 0.6, f"{scroll._pace:.2f}")
+
+    scroll._cancel_scroll_anim()
+    check("取消滚动后不再按拖动速度跑", scroll._dragging is False)
+    root.destroy()
+
+
+def test_winpaint_freeze():
+    """冻结重绘：可嵌套、异常也恢复、解冻后事件循环照常。"""
+    from roco.platform import winpaint
+
+    root = tk.Tk()
+    root.geometry("320x200+200+200")
+    root.update()
+
+    watch = winpaint.supported()
+    with winpaint.frozen_redraw(root):
+        first = winpaint.frozen_depth(root)
+        with winpaint.frozen_redraw(root):
+            nested = winpaint.frozen_depth(root)
+        back_to_outer = winpaint.frozen_depth(root)
+    final = winpaint.frozen_depth(root)
+    check("冻结层数可嵌套", (not watch) or (first == 1 and nested == 2),
+          f"{first}/{nested}")
+    check("内层退出不解冻", (not watch) or back_to_outer == 1, str(back_to_outer))
+    check("外层退出恢复重绘", final == 0, str(final))
+
+    boom = False
+    try:
+        with winpaint.frozen_redraw(root):
+            raise RuntimeError("构建失败")
+    except RuntimeError:
+        boom = True
+    check("构建异常也恢复重绘", boom and winpaint.frozen_depth(root) == 0)
+
+    alive = True
+    try:
+        root.update()          # 解冻后必须还能正常泵事件（不是 WS_EX_COMPOSITED 那种死锁）
+        root.update_idletasks()
+    except tk.TclError:
+        alive = False
+    check("解冻后事件循环照常", alive)
+    root.destroy()
+
+
+def test_image_loader_waiters():
+    """加载中的图标：后到的回调必须排队，不能丢（历史面板图标"不出来"的根因）。"""
+    from roco.services.cache import ImageLoader
+
+    class _NoCache:
+        def lookup(self, url):
+            return None
+
+        def download(self, url):
+            return None
+
+    root = tk.Tk()
+    root.withdraw()
+    loader = ImageLoader(root, _NoCache(), 16)
+    got: list = []
+    url = "https://example.invalid/a.png"
+    key = f"{url}@16"
+    loader._waiters[key] = []            # 模拟"已经在路上"
+    loader.load(url, got.append)
+    check("加载中的回调未丢弃", len(loader._waiters.get(key, [])) == 1,
+          str(len(loader._waiters.get(key, []))))
+    loader.load(url, got.append)
+    check("多个回调都排队", len(loader._waiters.get(key, [])) == 2,
+          str(len(loader._waiters.get(key, []))))
+    loader._finish(url, 16, None)        # 下载失败也要唤醒，否则卡片永远等
+    check("完成时唤醒全部回调", len(got) == 2, str(len(got)))
+    loader.shutdown()
+    root.destroy()
+
+
+def test_history_expand_atomic():
+    """展开历史：先预取图标、再建卡片，冻结重绘后一次性呈现，且不残留冻结。"""
+    from roco.core.history import HistoryRound
+    from roco.platform import winpaint
+    from roco.ui import theme
+    from roco.ui.history_panel import HistoryPanel
+
+    class _RecordingLoader:
+        """记录调用顺序的假加载器：prewarm 必须先于任何 load。"""
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def prewarm(self, urls, size=None):
+            self.calls.append(("prewarm", list(urls)))
+
+        def load(self, url, on_ready, size=None):
+            self.calls.append(("load", url))
+            on_ready(None)
+
+    theme.apply("dark", "")
+    root = tk.Tk()
+    root.geometry("1000x620+140+140")
+    loader = _RecordingLoader()
+    panel = HistoryPanel(root, loader=loader, expanded=False)
+    panel.pack(fill="x")
+    items = tuple(
+        MerchantItem(name=f"道具{i}", price=1000 * (i + 1), icon_url=f"u{i}", rounds=(1,))
+        for i in range(3)
+    )
+    panel.set_rounds([
+        HistoryRound(date="2026-10-25", round_index=r, items=items) for r in (4, 3, 2)
+    ])
+    root.update()
+
+    loader.calls.clear()
+    panel.toggle()
+    built_at_click = panel._build_index        # 点击返回时只建了第一轮
+    root.update()
+    kinds = [kind for kind, _value in loader.calls]
+    check("展开时先预取图标", bool(kinds) and kinds[0] == "prewarm", str(kinds[:3]))
+    prefetched = loader.calls[0][1] if kinds else []
+    check("预取覆盖全部图标",
+          len(prefetched) == 9 and set(prefetched) == {"u0", "u1", "u2"},
+          f"{len(prefetched)} 个")
+    check("预取发生在建卡片之前",
+          "prewarm" in kinds and "load" in kinds and kinds.index("prewarm") < kinds.index("load"),
+          str(kinds))
+
+    check("点击返回时只建了第一轮", built_at_click == 1, str(built_at_click))
+    check("第一轮已有内容", len(panel._body.winfo_children()) > 0,
+          str(len(panel._body.winfo_children())))
+
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        root.update()
+        time.sleep(0.02)
+        if not panel._build_job:
+            break
+    root.update()
+    check("轮次陆续补齐", panel._build_index >= 3, str(panel._build_index))
+    check("展开后冻结已恢复", winpaint.frozen_depth(panel) == 0,
+          str(winpaint.frozen_depth(panel)))
+    panel.destroy()
+    root.destroy()
+
+
 def main():
-    with preserve_app_files():
+    with preserve_app_files(), frozen_clock():
         _run_all()
 
     failed = 0
@@ -2226,7 +2691,11 @@ def _run_all():
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
                test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,
                test_main_window_geometry,
-               test_floating_icon_switch, test_tray_icon, test_close_to_tray_switch):
+               test_floating_icon_switch, test_tray_icon, test_close_to_tray_switch,
+               test_frame_pacing, test_widget_items_reuse,
+               test_floating_drag_contract, test_log_viewer_highlight,
+               test_scroll_pacing, test_winpaint_freeze,
+               test_image_loader_waiters, test_history_expand_atomic):
         try:
             fn()
         except Exception as exc:

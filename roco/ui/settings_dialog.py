@@ -70,7 +70,8 @@ class SettingsDialog(tk.Toplevel):
         self._build()
         self.update_idletasks()
         self.deiconify()
-        # Win11 质感：双缓冲 + 圆角阴影 + 标题栏明暗随主题（老系统静默跳过）
+        # Win11 质感：圆角阴影 + 标题栏明暗随主题（老系统静默跳过）。
+        # 注意这里没有"双缓冲"：WS_EX_COMPOSITED 对可见窗口是死锁组合，见 win11_style 注释
         win11_style.style_toplevel(self, dark=theme.is_dark())
         self.grab_set()
         self.bind("<Escape>", lambda _e: self._cancel())
@@ -398,7 +399,22 @@ class SettingsDialog(tk.Toplevel):
         self.clipboard_clear()
         self.clipboard_append(rules)
         self._net_hint.configure(text="已复制到剪贴板")
-        self.after(2600, lambda: self._net_hint.configure(text=""))
+        self._clear_net_hint_later()
+
+    def _clear_net_hint_later(self, delay: int = 2600) -> None:
+        """过一会儿清掉提示；面板先关掉时静默跳过，不落进 Tk 错误钩子。"""
+
+        def clear() -> None:
+            try:
+                if self._net_hint.winfo_exists():
+                    self._net_hint.configure(text="")
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(delay, clear)
+        except tk.TclError:
+            pass
 
     # -------------------------------------------------------------- 通知
     def _build_notify(self, master: tk.Misc) -> None:

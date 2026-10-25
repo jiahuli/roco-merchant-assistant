@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。

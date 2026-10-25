@@ -6,13 +6,23 @@
 * 拖动：按住顶部标题栏拖动（位置持久化到 config.floating_geometry）
 * 最小化：收起成一条 34px 的横条，只留商品数与倒计时
 * 不干扰主程序：独立 Toplevel，不 grab、不抢焦点，仅被动接收数据更新
+
+拖动为什么交给系统（1.9.1）
+---------------------------
+旧实现是每个 `<B1-Motion>` 都 `self.geometry()` 搬窗口。鼠标回报率高时每秒数百个
+事件，而 Tk 每次搬窗要重排重绘所有子窗口（实测单次 ≈ 9.6ms > 200Hz 的 5ms 帧预算），
+于是同一帧里父窗口已移动、子控件还在原地，画面就"撕"开了。
+现在按下超过阈值后把这一手势交给 Windows 的系统移动循环（`window_move.begin_drag`）：
+系统原子地搬整窗，应用一次绘制都不做。系统不认这条路时自动回落到应用内拖动
+（`_drag_move`，也是自测直接调用的入口）。
 """
 from __future__ import annotations
 
 import tkinter as tk
 from typing import Callable, Optional
 
-from roco.platform import monitors
+from roco import applog
+from roco.platform import monitors, window_move
 from roco.services.cache import ImageLoader
 from roco.config import Config
 from roco.core.models import MerchantSnapshot
@@ -51,6 +61,16 @@ class FloatingWindow(tk.Toplevel):
         self._count_text = ""
         self._monitors = monitors.enum_monitors()
         self._placed = False
+        # 拖动状态：press_root 为 None 表示"不是真实手势"（程序化调用），
+        # 这时 _drag_move 直接按偏移搬，保持 1.9 的语义（自测依赖这一点）
+        self._press_root: Optional[tuple[int, int]] = None
+        self._drag_offset: Optional[tuple[int, int]] = None
+        self._drag_gate = window_move.drag_threshold()
+        self._system_broken = not window_move.supported()
+        self._pending_size: Optional[int] = None
+        # 最近一次**请求**的位置：geometry 是异步生效的，winfo_x() 在本轮事件里
+        # 还是旧值；落盘和夹边都要按请求后的位置算，否则松手会被拽回原地
+        self._last_pos: Optional[tuple[int, int]] = None
 
         self.overrideredirect(True)          # 无系统边框：不出现在任务栏，不抢焦点
         self.attributes("-topmost", self._topmost)
@@ -103,7 +123,7 @@ class FloatingWindow(tk.Toplevel):
             widget.bind("<ButtonPress-1>", self._drag_start)
             widget.bind("<B1-Motion>", self._drag_move)
             widget.bind("<ButtonRelease-1>", self._drag_end)
-            widget.bind("<Double-Button-1>", lambda _e: self._activate())
+            widget.bind("<Double-Button-1>", self._double_click)
 
         # ---- 内容区 ----
         self.body = tk.Frame(self.card, bg=theme.SURFACE)
@@ -149,7 +169,14 @@ class FloatingWindow(tk.Toplevel):
 
     # ------------------------------------------------------------------ 尺寸
     def _apply_size(self, height: Optional[int] = None) -> None:
+        if self._press_root is not None:
+            # 拖动过程中改尺寸/位置会把窗口从光标下拽走（画面会"跳"一下）；
+            # 记下来，松手后 _finish_drag 再应用。-1 表示"用内容自然高度"
+            self._pending_size = height if height is not None else -1
+            return
         try:
+            # 刚建完的控件还没走过包管理器，reqheight 是旧值；
+            # 这里只做一次布局计算，不进入事件循环（不用 update()）
             self.update_idletasks()
         except tk.TclError:
             return
@@ -164,6 +191,11 @@ class FloatingWindow(tk.Toplevel):
             x, y = monitors.clamp_drag(self._monitors, x, y, self.WIDTH, height)
         else:
             x, y = monitors.default_position(self._monitors, self.WIDTH, height)
+        try:
+            if (self.WIDTH, height) == (self.winfo_width(), self.winfo_height()):
+                return      # 尺寸没变就不再发一次 SetWindowPos
+        except tk.TclError:
+            return
         self.geometry(f"{self.WIDTH}x{height}+{x}+{y}")
 
     def _restore_geometry(self) -> None:
@@ -191,9 +223,12 @@ class FloatingWindow(tk.Toplevel):
         self.geometry(f"{self.WIDTH}x{height}+{x}+{y}")
         self._placed = True
 
-    def save_geometry(self) -> None:
+    def save_geometry(self, pos: Optional[tuple[int, int]] = None) -> None:
+        """把当前位置写回配置；pos 用于"刚请求过、还没生效"的坐标。"""
         try:
-            self.config_data.floating_geometry = f"{self.WIDTH}x{self.winfo_height()}+{self.winfo_x()}+{self.winfo_y()}"
+            x, y = pos if pos is not None else (self.winfo_x(), self.winfo_y())
+            self.config_data.floating_geometry = (
+                f"{self.WIDTH}x{self.winfo_height()}+{x}+{y}")
         except tk.TclError:
             pass
 
@@ -202,23 +237,71 @@ class FloatingWindow(tk.Toplevel):
         # 拖之前重新枚举：用户可能刚插拔/切换了显示器
         self._monitors = monitors.enum_monitors()
         self._drag_offset = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+        self._press_root = (event.x_root, event.y_root)
 
     def _drag_move(self, event) -> None:
-        offset = getattr(self, "_drag_offset", None)
+        offset = self._drag_offset
         if not offset:
             return
-        x = event.x_root - offset[0]
-        y = event.y_root - offset[1]
-        # 只在"整个虚拟桌面"范围内约束：允许跨屏与跨屏边界，
-        # 但至少留 80px 可见，避免拖丢。绝对不能用主屏宽度来卡，
-        # 否则副屏在主屏右侧时窗口会被顶回来。
+        press = self._press_root
+        if press is None:
+            # 程序化调用（自测 / 旧路径）：按偏移直接搬，语义与 1.9 完全一致
+            self._move_to(event.x_root - offset[0], event.y_root - offset[1])
+            return
+
+        # 手指先走过系统拖动阈值，才开始搬窗口：这样标题栏的单击与
+        # 双击（打开主窗口）还能正常触发，不会一按下就被"拖走"
+        if (abs(event.x_root - press[0]) <= self._drag_gate
+                and abs(event.y_root - press[1]) <= self._drag_gate):
+            return
+
+        if not self._system_broken and self._system_drag(event, press):
+            return      # 系统移动循环已经把这个手势做完了
+        self._move_to(event.x_root - offset[0], event.y_root - offset[1])
+
+    def _move_to(self, x: int, y: int) -> None:
+        """应用内搬窗口（回落路径）：只在虚拟桌面内约束，允许跨屏与负坐标。"""
         x, y = monitors.clamp_drag(self._monitors, x, y, self.WIDTH, self.winfo_height())
-        self.geometry(f"+{x}+{y}")
+        self._last_pos = (x, y)
+        try:
+            self.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+
+    def _system_drag(self, event, press: tuple[int, int]) -> bool:
+        """把这个手势交给系统移动循环；返回 True 表示已处理完（松手后才返回）。"""
+        before = (self.winfo_x(), self.winfo_y())
+        if not window_move.begin_drag(self):
+            self._system_broken = True
+            applog.info("悬浮窗拖动 | 系统移动循环不可用，改用应用内拖动")
+            return False
+        after = (self.winfo_x(), self.winfo_y())
+        drift = abs(event.x_root - press[0]) + abs(event.y_root - press[1])
+        self._last_pos = after       # 系统已经搬完了，以它为准
+        self._finish_drag()
+        if after == before and drift >= 24:
+            # 循环跑完了窗口却没动：这台机器不认无边框窗口的 HTCAPTION，
+            # 别再让用户白拖一次，后续手势直接走应用内拖动
+            self._system_broken = True
+            applog.warning("悬浮窗拖动 | 系统移动循环未生效，后续改用应用内拖动")
+        return True
 
     def _drag_end(self, _event=None) -> None:
         """松手即停在原地，不吸附、不回弹——与 Windows 原生窗口一致。"""
+        self._finish_drag()
+
+    def _finish_drag(self) -> None:
+        """一次拖动收尾：解除状态 → 夹回可见区 → 落盘 → 应用被推迟的尺寸。"""
         self._drag_offset = None
-        self.save_geometry()
+        self._press_root = None
+        if self._last_pos is not None:
+            # 走一遍 clamp：系统可能把窗口拖出虚拟桌面（多屏拔插后尤其常见）
+            self._move_to(*self._last_pos)
+        pos, self._last_pos = self._last_pos, None
+        self.save_geometry(pos)
+        pending, self._pending_size = self._pending_size, None
+        if pending is not None:
+            self._apply_size(None if pending == -1 else pending)
 
     # ------------------------------------------------------------------ 交互
     def toggle_topmost(self) -> None:
@@ -276,6 +359,15 @@ class FloatingWindow(tk.Toplevel):
             self.body.pack(fill="both", expand=True)
             self.accent_bar.configure(bg=theme.ACCENT)
         self._apply_size()
+
+    def _double_click(self, event) -> None:
+        """双击标题栏叫出主窗口。
+
+        Tk 在双击时只发 `<Double-Button-1>`、**不发** `<ButtonPress-1>`（实测），
+        所以这里要顺手把按下状态记上，否则"双击完紧接着拖"会因为没记录起点而拖不动。
+        """
+        self._drag_start(event)
+        self._activate()
 
     def _activate(self) -> None:
         if self._on_activate:

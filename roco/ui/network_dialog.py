@@ -201,4 +201,19 @@ class NetworkDialog(tk.Toplevel):
         self.clipboard_clear()
         self.clipboard_append(rules)
         self._hint.configure(text="分流规则已复制到剪贴板", fg=theme.SUCCESS)
-        self.after(2600, lambda: self._hint.configure(text=""))
+        self._clear_hint_later()
+
+    def _clear_hint_later(self, delay: int = 2600) -> None:
+        """过一会儿清掉提示；面板先关掉时静默跳过，不落进 Tk 错误钩子。"""
+
+        def clear() -> None:
+            try:
+                if self._hint.winfo_exists():
+                    self._hint.configure(text="")
+            except tk.TclError:
+                pass
+
+        try:
+            self.after(delay, clear)
+        except tk.TclError:
+            pass

@@ -13,6 +13,8 @@ block_cipher = None
 hidden = [
     "roco", "roco.ui", "roco.ui.theme", "roco.ui.widgets", "roco.ui.app_window",
     "roco.ui.settings_dialog", "roco.ui.floating_window",
+    # 1.9.1：帧节拍与动画器（UI 层唯一的"平台感"依赖，漏了会退化成写死的 60fps 节拍）
+    "roco.ui.motion",
     "roco.net.providers", "roco.net.netdirect", "roco.net.catalog",
     "roco.core.rarity", "roco.core.numerals", "roco.core.models",
     "roco.core.freshness", "roco.core.history", "roco.core.purchases",
@@ -21,6 +23,10 @@ hidden = [
     "roco.platform.autostart", "roco.platform.single_instance",
     "roco.platform.monitors", "roco.platform.tray", "roco.platform.theme_listener",
     "roco.platform.memory", "roco.platform.win11_style",
+    # 1.9.1：刷新率/定时器精度、系统移动循环
+    "roco.platform.display", "roco.platform.window_move",
+    # 1.9.1：历史展开时冻结重绘，避免"空白卡片→文字→图标"分步出现
+    "roco.platform.winpaint",
     "roco.config", "roco.applog",
 ]
 

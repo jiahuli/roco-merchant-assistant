@@ -99,14 +99,18 @@ def build_commit_message(changes: list[str], version: str = "",
 
 
 def read_version() -> str:
-    """从 config.py 读 APP_VERSION，读不到就返回空（不让同步因此失败）。"""
-    path = ROOT / "config.py"
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("APP_VERSION"):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
+    """从 roco/config.py 读 APP_VERSION，读不到就返回空（不让同步因此失败）。
+
+    1.9 把运行时模块收进了 `roco/` 包，这里要跟着改，否则自动生成的提交
+    信息会少了版本号（`（v?）`）。旧路径保留作为兜底，方便老分支。
+    """
+    for candidate in (ROOT / "roco" / "config.py", ROOT / "config.py"):
+        try:
+            for line in candidate.read_text(encoding="utf-8").splitlines():
+                if line.startswith("APP_VERSION"):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
     return ""
 
 

@@ -1,4 +1,12 @@
-"""可复用界面控件：按钮、徽章、商品卡片、滚动容器、气泡提示。"""
+"""可复用界面控件：按钮、徽章、商品卡片、滚动容器、气泡提示。
+
+绘图约定（1.9.1 起）
+--------------------
+动画里的 Canvas 一律**复用 item**（`itemconfigure` / `coords`），而不是
+`delete("all")` 后重建：重建会先把整块擦成底色，高刷屏上每一帧都能看见那一下闪，
+观感就是"按钮在抖""滚动条在跳"。同理，所有动画都走 `roco.ui.motion`
+（按时长 + 真实帧率取帧），不再自己写 `after(24)` 这类写死的节拍。
+"""
 from __future__ import annotations
 
 import tkinter as tk
@@ -7,8 +15,8 @@ from typing import Callable, Optional
 from roco.services.cache import ICON_SIZE, ImageLoader
 from roco.platform import monitors
 from roco.core.models import MerchantItem
-from roco.ui import theme
-from roco.ui.theme import lighten, mix, round_rect, ui_font
+from roco.ui import motion, theme
+from roco.ui.theme import lighten, mix, round_rect, round_rect_points, ui_font
 
 
 def _parent_bg(widget: tk.Misc) -> str:
@@ -18,8 +26,14 @@ def _parent_bg(widget: tk.Misc) -> str:
         return theme.BG
 
 
-# 滚轮动画每帧走过的视口比例（15ms/帧 ≈ 每秒 3 屏）
-_SCROLL_SPEED = 0.045
+# 一格滚轮走多少视口
+_SCROLL_WHEEL_STEP = 0.18
+# 滚动速度：视口/秒。与帧率解耦——旧实现是"0.045 视口/帧"，帧率一变速度就变
+_SCROLL_VIEWPORTS_PER_SECOND = 3.0
+# 拖滚动条拇指时的追赶速度：要跟手，所以比滚轮快得多；但仍是"每帧一次搬动"，
+# 不是每个鼠标事件搬一次（后者在 1000Hz 鼠标下一帧能搬十几次 = 撕裂来源）
+_SCROLL_DRAG_VIEWPORTS_PER_SECOND = 12.0
+
 
 
 # ---------------------------------------------------------------------------
@@ -51,12 +65,13 @@ class PillButton(tk.Canvas):
         self._font = ui_font(font_size, "bold" if style == "primary" else "normal")
         self._hover = False
         self._enabled = True
-        # 悬停颜色过渡：t 从 0（常态）到 1（悬停），动画步进
+        # 悬停颜色过渡：t 从 0（常态）到 1（悬停），按时长补间（不再按帧数）
         self._hover_t = 0.0
-        self._anim_job: Optional[str] = None
 
         self._shape = None
         self._label = None
+        self._draw_size = (0, 0)
+        self._fade = motion.Animation(self)
         self._draw()
 
         self.bind("<Enter>", self._on_enter)
@@ -86,31 +101,41 @@ class PillButton(tk.Canvas):
         return self._colors()
 
     def _draw(self) -> None:
-        self.delete("all")
         fill, fg, outline = self._colors()
+        self._paint(fill, fg, outline)
+
+    def _paint(self, fill: str, fg: str, outline: str) -> None:
+        """同步画布内容；item 复用，只有尺寸变了才重建整块。"""
         width = int(self["width"])
         height = int(self["height"])
-        round_rect(
-            self, 1, 1, width - 1, height - 1, self._radius,
-            fill=fill, outline=outline or fill, width=1,
-        )
-        self.create_text(
-            width / 2, height / 2, text=self._text, fill=fg, font=self._font,
-        )
+        size = (width, height)
+        if self._shape is None or size != self._draw_size:
+            self.delete("all")
+            self._shape = round_rect(
+                self, 1, 1, width - 1, height - 1, self._radius,
+                fill=fill, outline=outline or fill, width=1,
+            )
+            self._label = self.create_text(
+                width / 2, height / 2, text=self._text, fill=fg, font=self._font,
+            )
+            self._draw_size = size
+            return
+        self.itemconfigure(self._shape, fill=fill, outline=outline or fill)
+        self.itemconfigure(self._label, text=self._text, fill=fg)
 
     # ---------------- 事件 ----------------
+    def _apply_hover(self, value: float) -> None:
+        self._hover_t = value
+        self._draw()
+
     def _animate_hover(self) -> None:
-        """悬停过渡：每 24ms 走 35% 剩余距离，约 3-4 帧完成，观感是渐变而非跳变。"""
-        self._anim_job = None
+        """悬停过渡：90ms 内渐变到位，与帧率无关（高刷屏上多画几帧，肉眼一样快）。"""
         target = 1.0 if self._hover else 0.0
-        diff = target - self._hover_t
-        if abs(diff) < 0.05:
+        if abs(target - self._hover_t) < 0.01:
             self._hover_t = target
             self._draw()
             return
-        self._hover_t += diff * 0.35
-        self._draw()
-        self._anim_job = self.after(24, self._animate_hover)
+        self._fade.tween(90, self._hover_t, target, self._apply_hover)
 
     def _on_enter(self, _event=None) -> None:
         self._hover = True
@@ -125,11 +150,7 @@ class PillButton(tk.Canvas):
         if not self._enabled:
             return
         fill, _fg, _o = self._palette()
-        self.delete("all")
-        round_rect(self, 1, 1, int(self["width"]) - 1, int(self["height"]) - 1,
-                   self._radius, fill=mix(fill, theme.BG, 0.18), outline="", width=0)
-        self.create_text(int(self["width"]) / 2, int(self["height"]) / 2,
-                         text=self._text, fill=theme.TEXT, font=self._font)
+        self._paint(mix(fill, theme.BG, 0.18), theme.TEXT, "")
 
     def _on_release(self, _event=None) -> None:
         self._draw()
@@ -137,7 +158,8 @@ class PillButton(tk.Canvas):
             self._command()
 
     def _on_configure(self, event) -> None:
-        self._draw()
+        if (int(event.width), int(event.height)) != self._draw_size:
+            self._draw()
 
     # ---------------- API ----------------
     def set_text(self, text: str) -> None:
@@ -274,7 +296,7 @@ class ItemCard(tk.Frame):
         # 悬停高亮：只改描边色（带渐变动画），避免子控件底色错位
         self._hovered = False
         self._border_t = 0.0              # 描边色过渡进度 0（常态）→ 1（悬停）
-        self._border_job: Optional[str] = None
+        self._border = motion.Animation(self)
         for widget in self._walk(self):
             widget.bind("<Enter>", self._on_enter, add="+")
             widget.bind("<Leave>", self._on_leave, add="+")
@@ -312,34 +334,22 @@ class ItemCard(tk.Frame):
         self._hovered = False
         self._animate_border(0.0)
 
+    def _apply_border(self, value: float) -> None:
+        self._border_t = value
+        self.configure(highlightbackground=mix(theme.BORDER, theme.BORDER_HOVER, value))
+
     def _animate_border(self, target: float) -> None:
-        """描边色渐变：24ms/帧走 40% 剩余距离，两三帧完成，鼠标扫过是"亮起"而不是"跳变"。"""
-        if self._border_job is not None:
-            try:
-                self.after_cancel(self._border_job)
-            except tk.TclError:
-                pass
-            self._border_job = None
+        """描边渐亮/渐暗：120ms，按真实帧率取帧。
 
-        def step() -> None:
-            self._border_job = None
-            if not self.winfo_exists():
-                return
-            diff = target - self._border_t
-            try:
-                if abs(diff) < 0.08:
-                    self._border_t = target
-                    self.configure(
-                        highlightbackground=mix(theme.BORDER, theme.BORDER_HOVER, target))
-                    return
-                self._border_t += diff * 0.4
-                self.configure(
-                    highlightbackground=mix(theme.BORDER, theme.BORDER_HOVER, self._border_t))
-            except tk.TclError:
-                return
-            self._border_job = self.after(24, step)
-
-        step()
+        旧实现是"每 24ms 走 40% 剩余距离"，且 job 从不取消——控件销毁后
+        回调仍会触发，异常被 Tk 吞掉（表现为界面卡住/莫名的"界面出错"）。
+        现在交给 `motion.Animation`：它绑定 `<Destroy>` 自动停表。
+        """
+        if abs(target - self._border_t) < 0.01:
+            self._border_t = target
+            self._apply_border(target)
+            return
+        self._border.tween(120, self._border_t, target, self._apply_border)
 
     # 图标异步加载（命中缓存则立即显示）
     def load_icon(self) -> None:
@@ -452,14 +462,22 @@ class ScrollFrame(tk.Frame):
         self.body.bind("<Configure>", self._on_body_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        self._thumb = None
-        self._last_thumb = None          # 上次绘制滚动条时的 (first,last,height)，去重用
+        self._thumb = self.bar.create_polygon(
+            0, 0, 0, 0, smooth=True, outline="",
+            fill=mix(theme.SURFACE_3, theme.BORDER_HOVER, 0.35), state="hidden",
+        )
+        self._thumb_signature = None     # 上次绘制时的 (first,last,height)，去重用
+        self._first, self._last = 0.0, 1.0
         self._scroll_target: Optional[float] = None
-        self._scroll_job: Optional[str] = None
+        self._ticker = motion.Ticker(self)
+        self._dragging = False
+        self._pace = 1.0                 # 帧时长闭环得出的速度系数（0.35–1.0）
         self._drag_origin = 0
         self._drag_top = 0.0
+        self._body_width_job: Optional[str] = None
         self.bar.bind("<Button-1>", self._on_bar_press)
         self.bar.bind("<B1-Motion>", self._on_bar_drag)
+        self.bar.bind("<ButtonRelease-1>", self._on_bar_release)
         self.bar.bind("<Enter>", lambda _e: self._draw_thumb())
         self._sync_mousewheel()
 
@@ -469,60 +487,89 @@ class ScrollFrame(tk.Frame):
         self._draw_thumb()
 
     def _on_canvas_configure(self, event) -> None:
-        self.canvas.itemconfigure(self._window, width=event.width)
-        self._draw_thumb()
+        """把画布宽度传给内嵌 frame——但要**攒到空闲时**做一次。
 
+        拖窗口边缘时这个回调按输入事件的频率到来，而宽度一旦变化，
+        内嵌 frame 及其下几十张卡片都要重排一遍；逐事件处理必然掉帧。
+        合并成每轮事件循环一次（宽度取那时的最新值），观感是"跟手但不抖"。
+        """
+        if self._body_width_job is None:
+            self._body_width_job = self.after_idle(self._apply_body_width)
+
+    def _apply_body_width(self) -> None:
+        self._body_width_job = None
+        try:
+            width = self.canvas.winfo_width()
+            if width > 1:
+                self.canvas.itemconfigure(self._window, width=width)
+        except tk.TclError:
+            return
     def _on_scroll(self, first: str, last: str) -> None:
         self._first, self._last = float(first), float(last)
         self._draw_thumb()
 
     # ---------------- 滚动条 ----------------
     def _draw_thumb(self) -> None:
-        if not hasattr(self, "_first"):
-            return
         first, last = self._first, self._last
         height = self.bar.winfo_height()
-        # 位置没变就不重绘：滚轮动画期间这个回调每帧都来，重画圆角多边形是纯浪费
+        # 位置没变就跳过：滚轮动画期间这个回调每帧都来
         signature = (round(first, 3), round(last, 3), height)
-        if signature == self._last_thumb:
+        if signature == self._thumb_signature:
             return
-        self._last_thumb = signature
-        self.bar.delete("all")
+        self._thumb_signature = signature
         if last - first >= 0.999 or height <= 1:
+            self._bar_item(state="hidden")
             return
-        top = max(0, first * height)
-        bottom = min(height, last * height)
+        top = max(0.0, first * height)
+        bottom = min(float(height), last * height)
         if bottom - top < 26:
             bottom = top + 26
-        self._thumb = round_rect(
-            self.bar, 2, top + 2, 6, bottom - 2, 2,
-            fill=mix(theme.SURFACE_3, theme.BORDER_HOVER, 0.35), outline="", width=0
+        # 同一个 item 原地改坐标：delete("all") 会先擦成底色，每帧都能看见闪
+        self._bar_item(
+            state="normal", points=round_rect_points(2, top + 2, 6, bottom - 2, 2)
         )
+
+    def _bar_item(self, state: str, points: Optional[list[float]] = None) -> None:
+        try:
+            if points is not None:
+                self.bar.coords(self._thumb, *points)
+            self.bar.itemconfigure(self._thumb, state=state)
+        except tk.TclError:
+            pass
 
     def _on_bar_press(self, event) -> None:
         self._cancel_scroll_anim()   # 用户手动拖动时停掉滚轮动画，避免抢位置
         height = self.bar.winfo_height() or 1
         self._drag_origin = event.y
-        self._drag_top = getattr(self, "_first", 0.0) * height
+        self._drag_top = self._first * height
 
     def _on_bar_drag(self, event) -> None:
         height = self.bar.winfo_height() or 1
         if height <= 26:
             return
+        # 只更新目标，真正的搬动交给帧节拍（每帧一次）。
+        # 旧实现在每个 <B1-Motion> 上都 yview_moveto：鼠标回报率高时同一帧能搬十几次，
+        # 每次都要把整屏子窗口重排重绘——快速滑动时看到的"撕裂"就是这么来的。
         target = (self._drag_top + (event.y - self._drag_origin)) / height
-        self.canvas.yview_moveto(max(0.0, min(1.0, target)))
+        self._scroll_target = max(0.0, min(1.0, target))
+        self._dragging = True
+        self._start_scroll_anim()
 
-    # ---------------- 滚轮（缓动动画） ----------------
+    def _on_bar_release(self, _event=None) -> None:
+        self._drag_origin = 0
+
+    # ---------------- 滚轮（按时间的缓动） ----------------
     def _sync_mousewheel(self) -> None:
         def on_wheel(event) -> None:
             if not self._pointer_inside() or not self._content_overflows():
                 return
-            # 旧实现一格滚 2 个单位 ≈ 20% 视口、瞬间到位——这正是"滑动卡顿"的观感来源。
-            # 现在把每格输入累积成目标位置，用 after 动画小步逼近，观感是连续平滑的。
-            step = (-1 if event.delta > 0 else 1) * 0.18
+            # 把每格输入累积成目标位置，再用"视口/秒"的速度逼近。
+            # 关键：速度按**时间**算，不按帧数——否则 200Hz 屏上会快三倍。
+            direction = -1 if event.delta > 0 else 1
             current = self._scroll_target if self._scroll_target is not None \
                 else self.canvas.yview()[0]
-            self._scroll_target = max(0.0, min(1.0, current + step))
+            self._scroll_target = max(
+                0.0, min(1.0, current + direction * _SCROLL_WHEEL_STEP))
             self._start_scroll_anim()
 
         # 绑到所属 Toplevel：只在本窗口内生效，窗口销毁时自动解除，不会残留
@@ -533,33 +580,47 @@ class ScrollFrame(tk.Frame):
         return last - first < 0.999
 
     def _start_scroll_anim(self) -> None:
-        if self._scroll_job is None:
-            self._animate_scroll()
+        if not self._ticker.running:
+            self._ticker.start(self._scroll_step)
 
-    def _animate_scroll(self) -> None:
-        self._scroll_job = None
+    def _scroll_step(self, dt: float) -> bool:
         if self._scroll_target is None:
-            return
+            self._dragging = False
+            return False
+        self._adapt_pace(dt)
         first = self.canvas.yview()[0]
-        diff = self._scroll_target - first
-        if abs(diff) < 0.001:
+        remaining = self._scroll_target - first
+        if abs(remaining) <= 0.0008:
             self.canvas.yview_moveto(self._scroll_target)
             self._scroll_target = None
-            return
-        # 匀速为主 + 末段轻缓动：按比例走但限幅——起停都跟手，没有"追不上/拖尾巴"
-        # 的滞留感。0.045 视口/帧（15ms）≈ 每秒 3 屏，一格滚轮 0.18 视口约 4 帧完成。
-        step = max(-_SCROLL_SPEED, min(_SCROLL_SPEED, diff * 0.6))
-        self.canvas.yview_moveto(first + step)
-        self._scroll_job = self.after(15, self._animate_scroll)
+            self._dragging = False
+            return False
+        # 卡顿超过 50ms 时限制单步位移，避免"憋久了猛跳一下"
+        base = (_SCROLL_DRAG_VIEWPORTS_PER_SECOND if self._dragging
+                else _SCROLL_VIEWPORTS_PER_SECOND)
+        step = base * self._pace * min(dt, 0.05)
+        delta = min(abs(remaining), step) * (1.0 if remaining > 0 else -1.0)
+        self.canvas.yview_moveto(max(0.0, min(1.0, first + delta)))
+        return True
+
+    def _adapt_pace(self, dt: float) -> None:
+        """按实测帧间隔调节滚动速度（帧同步闭环）。
+
+        一帧要重绘的子窗口越多，真实帧间隔就越长（视口内 12 张卡片已经吃掉
+        90fps 的全部预算）。这时还按"视口/秒"硬推，只会让每帧都超预算，
+        DWM 于是present 出半成品帧——也就是撕裂。这里用真实 dt 做闭环：
+        帧被拖长了就减速（最低 35%），回到预算内再逐步提速。
+        """
+        target = motion.frame_ms() / 1000.0
+        if dt > target * 1.6:
+            self._pace = max(0.35, self._pace * 0.85)
+        elif dt < target * 1.2:
+            self._pace = min(1.0, self._pace * 1.10)
 
     def _cancel_scroll_anim(self) -> None:
-        if self._scroll_job is not None:
-            try:
-                self.after_cancel(self._scroll_job)
-            except tk.TclError:
-                pass
-            self._scroll_job = None
+        self._ticker.stop()
         self._scroll_target = None
+        self._dragging = False      # 否则下一次滚轮会误用"拖动速度"
 
     def _pointer_inside(self) -> bool:
         try:
@@ -603,25 +664,33 @@ class StatBlock(tk.Frame):
 
 
 class StatusPill(tk.Canvas):
-    """营业中 / 已打烊 状态胶囊。"""
+    """营业中 / 已打烊 状态胶囊。
+
+    宽度**固定**：1.9 每次状态切换都按文字重算宽度（「营业中」87px、
+    「换货校验中」113px），右侧倒计时那一块就跟着左右跳一下。固定宽度 +
+    文字居中后，状态变化只换颜色与文案，布局纹丝不动。
+    """
+
+    WIDTH = 118
+    HEIGHT = 28
 
     def __init__(self, master: tk.Misc, bg: Optional[str] = None) -> None:
         bg = bg or _parent_bg(master)
-        super().__init__(master, width=104, height=28, bg=bg, highlightthickness=0, bd=0)
+        super().__init__(master, width=self.WIDTH, height=self.HEIGHT, bg=bg,
+                         highlightthickness=0, bd=0)
         self._bg = bg
-        self.set_state("查询中", theme.MUTED)
+        muted = theme.MUTED
+        self._shape = round_rect(self, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 13,
+                                 fill=mix(muted, bg, 0.82), outline="", width=0)
+        self._dot = self.create_oval(14, 11, 22, 19, fill=muted, outline="")
+        self._label = self.create_text((28 + self.WIDTH - 8) / 2, 14, text="查询中",
+                                       fill=muted, font=ui_font(9, "bold"))
 
     def set_state(self, text: str, color: str) -> None:
-        self.delete("all")
-        width = max(84, 26 + self._text_width(text) + 22)
-        self.configure(width=width, height=28)
-        round_rect(self, 1, 1, width - 1, 27, 13, fill=mix(color, self._bg, 0.82),
-                   outline="", width=0)
-        self.create_oval(14, 11, 22, 19, fill=color, outline="")
-        self.create_text((28 + width - 8) / 2, 14, text=text, fill=color,
-                         font=ui_font(9, "bold"))
-
-    @staticmethod
-    def _text_width(text: str) -> int:
-        """粗略估算：中文按 13px，其余按 7px。"""
-        return sum(13 if ord(ch) > 127 else 7 for ch in text)
+        """改状态只更新已有 item，不重建画布——重建会擦底，高刷下能看见闪。"""
+        try:
+            self.itemconfigure(self._shape, fill=mix(color, self._bg, 0.82))
+            self.itemconfigure(self._dot, fill=color)
+            self.itemconfigure(self._label, text=text, fill=color)
+        except tk.TclError:
+            pass

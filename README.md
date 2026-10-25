@@ -25,6 +25,8 @@
 - **自定义强调色**：内置 6 色预设，也可在设置 →「外观」里填任意 `#rrggbb`
 - 滚轮平滑滚动（缓动动画）；查询结果卡片瀑布式入场，图标预加载同步就位，无逐条闪烁
 - 按钮与卡片悬停带渐变过渡反馈
+- **动画帧率随屏幕自适应，封顶 90fps**：高刷屏上更顺，又不至于为了吃满刷新率白烧 CPU
+- **悬浮窗拖动无撕裂**：拖动交给 Windows 系统移动循环，整窗原子移动、应用不重绘
 - 设置、日志、选择器等弹窗均无白屏闪烁
 - 后台常驻时自动修剪工作集，内存占用低（私有提交 < 30 MB）
 
@@ -312,7 +314,7 @@ roco-merchant/
 ├── main.py                     # 入口：版本检查、DPI、单实例、协议参数、日志初始化
 ├── app.spec                    # PyInstaller 配置（单文件 / 无控制台 / 图标）
 ├── requirements.txt            # 无必装依赖；Pillow 为可选增强
-├── selftest.py                 # 自测（340 项）
+├── selftest.py                 # 自测（386 项）
 │
 ├── roco/                       # 全部运行时模块（依赖方向：ui → services → net → core）
 │   ├── config.py               #   配置读写、渠道表、缓存/日志目录解析、资源路径
@@ -339,12 +341,16 @@ roco-merchant/
 │   │   ├── notifier_native.py  #     WinRT Toast、AppUserModelID、rocomesh:// 协议注册
 │   │   ├── autostart.py        #     开机自启（HKCU Run 键）
 │   │   ├── single_instance.py  #     单实例互斥与唤醒
-│   │   └── monitors.py         #     多显示器边界（EnumDisplayMonitors）
+│   │   ├── monitors.py         #     多显示器边界（EnumDisplayMonitors）
+│   │   ├── display.py          #     刷新率 → 帧间隔（上限 90fps）+ 定时器精度
+│   │   ├── window_move.py      #     窗口拖动交给系统移动循环（无撕裂）
+│   │   └── winpaint.py         #     批量建控件时冻结重绘，一次上屏（无分步闪烁）
 │   └── ui/                     #   界面层（唯一 import Tk 的地方）
 │       ├── app_window.py       #     主窗口视图：布局 / 渲染 / 托盘 / 悬浮窗
 │       ├── app_controller.py   #     视图控制器：取数编排 / 换货校验 / 落盘 / 通知决策
 │       ├── settings_dialog.py  #     设置面板、network_dialog、history_panel、floating_window 等
 │       ├── widgets.py          #     自绘控件（PillButton / ItemCard / ScrollFrame…）
+│       ├── motion.py           #     帧节拍动画（时长补间 / 连续节拍，销毁自动停表）
 │       └── theme.py            #     颜色与字体
 │
 ├── scripts/                    # 所有可双击运行的脚本
@@ -395,7 +401,7 @@ roco-merchant/
 python selftest.py
 ```
 
-覆盖 340 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
+覆盖 386 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
 通知 XML 与去重、图标缓存与迁移、缓存/日志目录回退、自启命令拼装、单实例互斥与唤醒、
 悬浮窗渲染与收起、多屏边界（合成三屏，含左侧负坐标副屏）、真实双屏下的副屏落位与持久化、
 托盘创建与清理、关闭到托盘后仍能恢复、界面异常落盘、悬浮窗图标开关（开/关后行数与文字不变）、

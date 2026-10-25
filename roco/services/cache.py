@@ -129,7 +129,10 @@ class ImageLoader:
         self.cache = cache
         self.size = size
         self._memory: dict[tuple[str, int], tk.PhotoImage] = {}
-        self._pending: set[str] = set()
+        # 正在加载的 key → 等结果的回调列表。**不能只记录 key**：
+        # 加载进行中又来一个 load() 时若直接 return，那个回调就永远收不到图，
+        # 卡片会一直停在占位字母上（历史面板"图标有时不出来"就是这个）。
+        self._waiters: dict[str, list[Callable]] = {}
         # 下载/解码并发 2 足够：图标小、磁盘缓存命中率高，4 线程只是徒增栈内存
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="icon")
         self._queue: queue.Queue = queue.Queue()
@@ -156,18 +159,16 @@ class ImageLoader:
             if not url or (url, size) in self._memory:
                 continue
             key = f"{url}@{size}"
-            if key in self._pending:
+            if key in self._waiters:
                 continue
-            self._pending.add(key)
+            self._waiters[key] = []          # 占位：表示"这个图标正在路上"
             path = self.cache.lookup(url)
             if path:
                 try:
                     photo = self._decode(path.read_bytes(), size)
                 except OSError:
                     photo = None
-                if photo is not None:
-                    self._memory[(url, size)] = photo
-                self._pending.discard(key)
+                self._finish(url, size, photo)
                 continue
             self._executor.submit(self._prewarm_work, url, size)
 
@@ -177,7 +178,7 @@ class ImageLoader:
         data = local.read_bytes() if local else None
         if self._closed:
             return
-        self._queue.put((url, size, data, None))   # on_ready=None：只进内存缓存
+        self._queue.put((url, size, data))
 
     def load(self, url: str, on_ready: Callable[[Optional[tk.PhotoImage]], None], size: int | None = None) -> None:
         """有缓存立刻回调；否则后台下载后回到主线程回调。"""
@@ -191,14 +192,16 @@ class ImageLoader:
             return
 
         key = f"{url}@{size}"
-        if key in self._pending:
+        waiters = self._waiters.get(key)
+        if waiters is not None:
+            waiters.append(on_ready)         # 已经在路上：排队等结果，别丢回调
             return
-        self._pending.add(key)
+        self._waiters[key] = [on_ready]
 
         path = self.cache.lookup(url)
         if path:
             photo = self._decode(path.read_bytes(), size)
-            self._finish(url, size, photo, on_ready)
+            self._finish(url, size, photo)
             return
 
         def work() -> None:
@@ -207,7 +210,7 @@ class ImageLoader:
             if self._closed:
                 return
             # 交给主线程处理：Tk 对象只能在主线程创建
-            self._queue.put((url, size, data, on_ready))
+            self._queue.put((url, size, data))
 
         self._executor.submit(work)
 
@@ -220,24 +223,24 @@ class ImageLoader:
         self._poll_job = None
         while True:
             try:
-                url, size, data, on_ready = self._queue.get_nowait()
+                url, size, data = self._queue.get_nowait()
             except queue.Empty:
                 break
             photo = self._decode(data, size) if data else None
-            self._finish(url, size, photo, on_ready)
+            self._finish(url, size, photo)
         self._ensure_pump()
 
-    def _finish(self, url: str, size: int, photo, on_ready) -> None:
-        self._pending.discard(f"{url}@{size}")
+    def _finish(self, url: str, size: int, photo) -> None:
+        """加载完成：入内存缓存，并唤醒所有排队的回调（可能不止一个）。"""
+        waiters = self._waiters.pop(f"{url}@{size}", [])
         if photo is not None:
             self._memory[(url, size)] = photo
             self._evict_if_needed()
-        if on_ready is None:               # 预热路径：只进缓存，无需上屏回调
-            return
-        try:
-            on_ready(photo)
-        except tk.TclError:  # 窗口已销毁
-            pass
+        for on_ready in waiters:
+            try:
+                on_ready(photo)
+            except tk.TclError:  # 窗口已销毁
+                pass
 
     def _evict_if_needed(self) -> None:
         """内存缓存封顶：dict 保持插入序，超出上限时淘汰最旧的条目。"""
