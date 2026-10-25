@@ -649,6 +649,33 @@ def test_logging():
     root.destroy()
 
 
+def test_crash_log():
+    """硬崩溃现场：faulthandler 必须把线程栈写进 logs/crash.log。
+
+    为什么单独立项：`sys.excepthook` / Tk 钩子只接得住 Python 异常；1.9.1 那种
+    `abort()`（0xc0000409）会直接掀掉进程，app.log 里一个字都不留。
+    """
+    import faulthandler as fh
+
+    from roco import applog
+
+    applog.setup(Config())                       # 让 _current_dir 指向真实日志目录
+    path = applog.install_crash_log()
+    check("崩溃日志已安装", path is not None and path.name == applog.CRASH_FILENAME, str(path))
+    check("崩溃日志文件已创建", path is not None and path.exists(), str(path))
+    check("崩溃日志安装幂等", applog.install_crash_log() == path, str(path))
+    check("faulthandler 已启用", fh.is_enabled(), str(fh.is_enabled()))
+
+    stream = applog.crash_stream()
+    check("崩溃日志流可用", stream is not None and not stream.closed, str(stream))
+    if stream is not None and path is not None:
+        fh.dump_traceback(file=stream, all_threads=True)     # 真写一次，证明 fd 有效
+        stream.flush()
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        check("崩溃日志能写入线程栈", "Thread 0x" in content, content[-90:])
+        check("崩溃日志标注会话头", "崩溃现场会话" in content)
+
+
 def test_tk_error_hook():
     """界面回调异常要落到日志里，而不是消失。"""
     from roco import applog
@@ -2397,7 +2424,6 @@ def test_floating_drag_contract():
           f"{(window.winfo_x(), window.winfo_y())}")
 
     # 2) 阈值内的微小抖动不搬窗口：标题栏的单击/双击必须照旧
-    window._system_broken = True          # 强制走应用内路径，别真弹系统移动循环
     window._drag_start(_Event(60, 40))
     window._drag_move(_Event(62, 41))
     window.update()
@@ -2426,6 +2452,70 @@ def test_floating_drag_contract():
     window.update()
     check("松手后应用推迟的尺寸", window.winfo_height() == 150, str(window.winfo_height()))
 
+    window.destroy()
+    root.destroy()
+
+
+def test_floating_drag_frame_paced():
+    """拖动按帧合并：一帧内十几个移动事件只搬一次；阻塞式系统移动循环已移除。
+
+    背景：1.9.1 用 `SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)` 把拖动交给系统移动循环，
+    ctypes 释放 GIL 后系统模态循环会同步重入 Python，触发
+    `PyEval_RestoreThread` 致命错误 → abort（0xc0000409，无 traceback 直接闪退）。
+    """
+    from roco.platform import monitors, window_move
+    from roco.ui.floating_window import FloatingWindow
+
+    check("系统模态移动循环已移除", not hasattr(window_move, "begin_drag"),
+          "window_move.begin_drag 仍存在（会重入 Python 闪退）")
+    check("悬浮窗不再持有系统拖动状态",
+          not hasattr(FloatingWindow, "_system_drag"), "仍有 _system_drag")
+
+    config = Config()
+    config.floating_geometry = ""
+    root = tk.Tk()
+    root.withdraw()
+    window = FloatingWindow(root, config)
+    window.update()
+
+    class _Event:
+        def __init__(self, x: int, y: int) -> None:
+            self.x_root = x
+            self.y_root = y
+
+    window._monitors = monitors.enum_monitors()
+    # 先把它摆到固定位置（默认落点是屏幕右下角，直接按绝对坐标算会偏）
+    window._drag_offset = (0, 0)
+    window._press_root = None
+    window._drag_move(_Event(400, 300))
+    window._drag_end()
+    window.update()
+
+    calls = {"n": 0}
+    real_move = window._move_to
+
+    def counting(x: int, y: int) -> None:
+        calls["n"] += 1
+        real_move(x, y)
+
+    window._move_to = counting
+    try:
+        window._drag_start(_Event(400, 300))
+        target = (400, 300)
+        for step in range(14):        # 模拟 1000Hz 鼠标一帧内送来的十几个事件
+            target = (400 + step * 4, 300 + step * 3)
+            window._drag_move(_Event(*target))
+        check("一帧内多次移动只搬一次", calls["n"] <= 2, f"{calls['n']} 次")
+        window._drag_end()
+        window.update()
+        check("松手落在最后的目标位置",
+              (window.winfo_x(), window.winfo_y()) == target,
+              f"{(window.winfo_x(), window.winfo_y())} 期望 {target}")
+        check("拖动结束写入几何", config.floating_geometry.endswith(f"+{target[0]}+{target[1]}"),
+              config.floating_geometry)
+        check("帧节拍已停", window._move_job is None, str(window._move_job))
+    finally:
+        window._move_to = real_move
     window.destroy()
     root.destroy()
 
@@ -2677,7 +2767,8 @@ def _run_all():
                test_cache_path, test_autostart, test_native_notify,
                test_single_instance, test_floating_window, test_config_roundtrip,
                test_notify_fallback_chain, test_monitor_math,
-               test_floating_multimonitor, test_logging, test_tk_error_hook,
+               test_floating_multimonitor, test_logging, test_crash_log,
+               test_tk_error_hook,
                test_rounds_parsing, test_round_lag_detection, test_round_retry_flow,
                test_shelf_freshness_rules, test_all_day_recheck_flow,
                test_provider_onebiji, test_price_units,
@@ -2693,7 +2784,8 @@ def _run_all():
                test_main_window_geometry,
                test_floating_icon_switch, test_tray_icon, test_close_to_tray_switch,
                test_frame_pacing, test_widget_items_reuse,
-               test_floating_drag_contract, test_log_viewer_highlight,
+               test_floating_drag_contract, test_floating_drag_frame_paced,
+               test_log_viewer_highlight,
                test_scroll_pacing, test_winpaint_freeze,
                test_image_loader_waiters, test_history_expand_atomic):
         try:

@@ -91,6 +91,15 @@ def main() -> int:
     except Exception:
         pass  # 日志起不来也不能挡住主流程
 
+    # 再挂硬崩溃现场：C 层崩溃（abort / 栈溢出 / 段错误）不走 Python 钩子，
+    # 只有 faulthandler 能把当时的线程栈写进 logs/crash.log
+    try:
+        crash_path = applog.install_crash_log(config)
+        if crash_path is not None:
+            applog.info("崩溃现场日志 | %s", crash_path)
+    except Exception:
+        pass
+
     root = tk.Tk()
     app = MerchantApp(root, config)
 

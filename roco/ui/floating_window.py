@@ -7,22 +7,31 @@
 * 最小化：收起成一条 34px 的横条，只留商品数与倒计时
 * 不干扰主程序：独立 Toplevel，不 grab、不抢焦点，仅被动接收数据更新
 
-拖动为什么交给系统（1.9.1）
----------------------------
-旧实现是每个 `<B1-Motion>` 都 `self.geometry()` 搬窗口。鼠标回报率高时每秒数百个
-事件，而 Tk 每次搬窗要重排重绘所有子窗口（实测单次 ≈ 9.6ms > 200Hz 的 5ms 帧预算），
-于是同一帧里父窗口已移动、子控件还在原地，画面就"撕"开了。
-现在按下超过阈值后把这一手势交给 Windows 的系统移动循环（`window_move.begin_drag`）：
-系统原子地搬整窗，应用一次绘制都不做。系统不认这条路时自动回落到应用内拖动
-（`_drag_move`，也是自测直接调用的入口）。
+拖动怎么搬窗口（1.9.2）
+-----------------------
+**一帧只搬一次**，不交给系统的模态移动循环。
+
+* 1.9 的做法：每个 `<B1-Motion>` 都 `self.geometry()`。高回报率鼠标一帧能送来十几个
+  事件，等于同一帧里搬了十几次——父窗口先动、子控件后动，合成出来就是撕裂的半成品帧。
+* 1.9.1 的做法：`SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)` 交给系统移动循环。
+  撕裂没了，但**会随机崩溃**：ctypes 调 `SendMessageW` 时释放了 GIL，而系统模态循环
+  会把 `WM_MOUSEMOVE` 同步派发回窗口过程，Tk 就地重入 Python 绑定，此时该线程没有
+  Python 线程状态 → `PyEval_RestoreThread` 致命错误 → `abort()`（0xc0000409）。
+  细节与复现实测写在 `roco/platform/window_move.py` 的模块注释里。
+* 现在：`_drag_move` 只记录目标位置，由帧节拍（`_queue_move` / `_step_move`）统一搬，
+  每帧最多一次 `wm geometry`（Tk 内部就是一次异步 `SetWindowPos`，0.001ms 入队、
+  1.3ms 落地）。每帧只有一个位置，画面永远完整；全程没有阻塞式 Win32 调用，
+  不会再重入 Python。
+
+`_drag_move` 的**程序化**入口（`_drag_offset` 有值但 `_press_root` 为 None）仍然立即
+搬窗口——自测直接调用它，语义必须保持不变。
 """
 from __future__ import annotations
 
 import tkinter as tk
 from typing import Callable, Optional
 
-from roco import applog
-from roco.platform import monitors, window_move
+from roco.platform import display, monitors, window_move
 from roco.services.cache import ImageLoader
 from roco.config import Config
 from roco.core.models import MerchantSnapshot
@@ -66,7 +75,9 @@ class FloatingWindow(tk.Toplevel):
         self._press_root: Optional[tuple[int, int]] = None
         self._drag_offset: Optional[tuple[int, int]] = None
         self._drag_gate = window_move.drag_threshold()
-        self._system_broken = not window_move.supported()
+        # 帧合并：本帧还没搬过的位置（None = 本帧可以立刻搬）
+        self._drag_target: Optional[tuple[int, int]] = None
+        self._move_job: Optional[str] = None
         self._pending_size: Optional[int] = None
         # 最近一次**请求**的位置：geometry 是异步生效的，winfo_x() 在本轮事件里
         # 还是旧值；落盘和夹边都要按请求后的位置算，否则松手会被拽回原地
@@ -255,12 +266,46 @@ class FloatingWindow(tk.Toplevel):
                 and abs(event.y_root - press[1]) <= self._drag_gate):
             return
 
-        if not self._system_broken and self._system_drag(event, press):
-            return      # 系统移动循环已经把这个手势做完了
-        self._move_to(event.x_root - offset[0], event.y_root - offset[1])
+        self._queue_move(event.x_root - offset[0], event.y_root - offset[1])
+
+    def _queue_move(self, x: int, y: int) -> None:
+        """真实手势的搬窗入口：**一帧最多搬一次**。
+
+        高回报率鼠标一帧能送来十几个 `<B1-Motion>`。逐个搬的话，同一帧里窗口会出现
+        多个位置，DWM 合成时取到"父窗口已动、子控件还停在旧位"的那一张，就是撕裂。
+        这里只记下最新目标，由帧节拍统一落地——每帧只有一个位置，画面完整。
+
+        本帧第一次（`_move_job` 为空）**立即**搬，不加延迟，手感跟手；
+        之后到本帧结束前只更新目标。
+        """
+        if self._move_job is None:
+            self._move_to(x, y)
+            self._drag_target = None
+            self._move_job = self.after(display.frame_ms(), self._step_move)
+        else:
+            self._drag_target = (x, y)
+
+    def _step_move(self) -> None:
+        """帧节拍：落地本帧合并后的最新位置；手势没结束就继续下一帧。"""
+        self._move_job = None
+        target, self._drag_target = self._drag_target, None
+        if target is not None:
+            self._move_to(*target)
+        if self._press_root is not None:
+            self._move_job = self.after(display.frame_ms(), self._step_move)
+
+    def _cancel_move(self) -> None:
+        """停掉帧节拍（松手、销毁、主题重建前都要停，否则回调打到死窗口上）。"""
+        if self._move_job is not None:
+            try:
+                self.after_cancel(self._move_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._move_job = None
+        self._drag_target = None
 
     def _move_to(self, x: int, y: int) -> None:
-        """应用内搬窗口（回落路径）：只在虚拟桌面内约束，允许跨屏与负坐标。"""
+        """把窗口搬到 (x, y)：只在虚拟桌面内约束，允许跨屏与负坐标。"""
         x, y = monitors.clamp_drag(self._monitors, x, y, self.WIDTH, self.winfo_height())
         self._last_pos = (x, y)
         try:
@@ -268,40 +313,33 @@ class FloatingWindow(tk.Toplevel):
         except tk.TclError:
             pass
 
-    def _system_drag(self, event, press: tuple[int, int]) -> bool:
-        """把这个手势交给系统移动循环；返回 True 表示已处理完（松手后才返回）。"""
-        before = (self.winfo_x(), self.winfo_y())
-        if not window_move.begin_drag(self):
-            self._system_broken = True
-            applog.info("悬浮窗拖动 | 系统移动循环不可用，改用应用内拖动")
-            return False
-        after = (self.winfo_x(), self.winfo_y())
-        drift = abs(event.x_root - press[0]) + abs(event.y_root - press[1])
-        self._last_pos = after       # 系统已经搬完了，以它为准
-        self._finish_drag()
-        if after == before and drift >= 24:
-            # 循环跑完了窗口却没动：这台机器不认无边框窗口的 HTCAPTION，
-            # 别再让用户白拖一次，后续手势直接走应用内拖动
-            self._system_broken = True
-            applog.warning("悬浮窗拖动 | 系统移动循环未生效，后续改用应用内拖动")
-        return True
-
     def _drag_end(self, _event=None) -> None:
         """松手即停在原地，不吸附、不回弹——与 Windows 原生窗口一致。"""
         self._finish_drag()
 
     def _finish_drag(self) -> None:
-        """一次拖动收尾：解除状态 → 夹回可见区 → 落盘 → 应用被推迟的尺寸。"""
+        """一次拖动收尾：停节拍 → 落地最后位置 → 夹回可见区 → 落盘 → 应用推迟的尺寸。"""
+        # 先把本帧合并的最新目标取出来：松手时的最后一段位移不能丢（丢了几像素，
+        # 窗口就会"差了半格"停在原处）
+        target, self._drag_target = self._drag_target, None
+        self._cancel_move()
         self._drag_offset = None
         self._press_root = None
+        if target is not None:
+            self._move_to(*target)
         if self._last_pos is not None:
-            # 走一遍 clamp：系统可能把窗口拖出虚拟桌面（多屏拔插后尤其常见）
+            # 再走一遍 clamp：多屏拔插后可能已经落在虚拟桌面外
             self._move_to(*self._last_pos)
         pos, self._last_pos = self._last_pos, None
         self.save_geometry(pos)
         pending, self._pending_size = self._pending_size, None
         if pending is not None:
             self._apply_size(None if pending == -1 else pending)
+
+    def destroy(self) -> None:
+        """销毁前停表：帧节拍持有的 after job 不能留到窗口已死之后。"""
+        self._cancel_move()
+        super().destroy()
 
     # ------------------------------------------------------------------ 交互
     def toggle_topmost(self) -> None:
