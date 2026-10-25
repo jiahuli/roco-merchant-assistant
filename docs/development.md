@@ -327,6 +327,7 @@ python tools\publish.py --push-only                 :: 只推送已有提交（�
 | **threading 里碰 Tk** | 随机崩溃 / 静默失效 | 一律 `queue` + 主线程 `after` |
 | **自测污染真实配置** | 测试改过的开关留在用户 config，看着像 bug | `preserve_app_files()` 备份还原 config/state + 注册表 |
 | **`rounds` 语义** | 条件球"一直在"被当成没刷新 | 它是 `(1,2,3,4)` 全天商品，正常 |
+| **`gh` 不在 PATH** | `tools/release.py` 报 `FileNotFoundError [WinError 2]`，发布中断（此时 Release 尚未创建） | 脚本已自动探测 `C:\Program Files\GitHub CLI`；新装 gh 后建议重开终端 |
 | **价格里的简写单位** | `价格：16w` 被读成 16，界面显示"十六"、传说物品不再提醒 | `_to_int()` 认识 `万/w/亿/千/k`（`16w` → 160000）；页面价格正则要抓整段，别用 `[0-9]` 截断 |
 
 ---

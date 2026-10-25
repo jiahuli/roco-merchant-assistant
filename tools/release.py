@@ -40,9 +40,43 @@ def version() -> str:
     return APP_VERSION
 
 
+# gh 在 Windows 上不一定进 PATH（默认装在 Program Files 下），
+# 先按 PATH 找，再退回常见安装位置；都找不到才报错。
+_GH_CANDIDATES = (
+    "gh",
+    r"C:\Program Files\GitHub CLI\gh.exe",
+    r"C:\Program Files (x86)\GitHub CLI\gh.exe",
+    str(Path.home() / "AppData" / "Local" / "GitHubCLI" / "gh.exe"),
+)
+_gh_binary: str | None = None
+
+
+def gh_binary() -> str:
+    global _gh_binary
+    if _gh_binary:
+        return _gh_binary
+    for candidate in _GH_CANDIDATES:
+        try:
+            probe = subprocess.run([candidate, "--version"], capture_output=True,
+                                   text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            _gh_binary = candidate
+            return candidate
+    raise RuntimeError(
+        "找不到 gh（GitHub CLI）：请安装后重新打开终端，"
+        "或把 gh.exe 所在目录加入 PATH。下载：https://cli.github.com/"
+    )
+
+
 def gh(*args: str, check: bool = True) -> str:
-    result = subprocess.run(["gh", *args], capture_output=True, text=True,
-                            encoding="utf-8", errors="replace")
+    binary = gh_binary()
+    try:
+        result = subprocess.run([binary, *args], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise RuntimeError(f"无法执行 gh（{binary}）：{exc}") from exc
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
     return result.stdout.strip()
