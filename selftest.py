@@ -1681,6 +1681,14 @@ def test_purchase_and_history_widgets():
             history_mod.HistoryRound("2026-10-25", 3, (MerchantItem("B", 1, 1),)),
         ])
         check("历史面板默认折叠", panel._expanded is False)
+
+        empty = HistoryPanel(root)
+        empty.set_rounds([])
+        empty.toggle()
+        check("没有数据时不可展开", empty._expanded is False)
+        check("没有数据时按钮为禁用态",
+              empty._toggle_btn._text == "暂无历史" and not empty._toggle_btn._enabled,
+              f"{empty._toggle_btn._text}/{empty._toggle_btn._enabled}")
         panel.toggle()
         check("展开后渲染出内容",
               panel._expanded and len(panel._body.winfo_children()) >= 2,
@@ -1779,6 +1787,111 @@ def test_purchase_area_flow():
             root.destroy()
         except tk.TclError:
             pass
+
+
+def test_history_settings():
+    """历史开关与目录：解析、回退、迁移、配置容错。"""
+    import json
+    import tempfile
+    from datetime import datetime
+    from pathlib import Path
+
+    import history
+    from config import Config, default_history_dir, resolve_history_dir
+
+    with tempfile.TemporaryDirectory() as folder:
+        target = Path(folder) / "h"
+        cfg = Config()
+        cfg.history_dir = str(target)
+        path, warning = resolve_history_dir(cfg)
+        check("自定义历史目录可用", path == target and not warning, f"{path}/{warning}")
+        check("目录会被自动创建", target.is_dir())
+
+        # 拿一个"文件"当目录：必须回退默认并给出提示，而不是抛异常
+        blocker = Path(folder) / "blocker.txt"
+        blocker.write_text("x", encoding="utf-8")
+        cfg.history_dir = str(blocker)
+        path, warning = resolve_history_dir(cfg)
+        check("不可用目录回退默认", path == default_history_dir() and bool(warning), warning)
+
+        # 切换目录时迁移旧记录
+        src, dst = Path(folder) / "src", Path(folder) / "dst"
+        src.mkdir(); dst.mkdir()
+        snap = MerchantSnapshot(
+            items=[MerchantItem("国王球", 160000, 1, rounds=(2,))],
+            status="open", round_index=2,
+            fetched_at=datetime(2026, 10, 25, 13, 0),
+        )
+        history.record(snap, path=history.history_path(src),
+                       now=datetime(2026, 10, 25, 13, 0))
+        check("切换目录会搬走旧记录", history.migrate(src, dst))
+        check("新目录能读到旧记录", bool(history.load(history.history_path(dst))))
+        check("旧目录文件已移走", not history.history_path(src).exists())
+
+        # 手改配置：字符串 "false" 必须识别为关闭（bool("false") 会是 True）
+        raw = {"history_enabled": "false", "history_dir": 123}
+        cfg_path = Path(folder) / "config.json"
+        cfg_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        loaded = Config.load(cfg_path)
+        check("字符串 false 能识别为关闭", loaded.history_enabled is False,
+              str(loaded.history_enabled))
+        check("非字符串目录回落为空", loaded.history_dir == "", repr(loaded.history_dir))
+
+
+def test_history_disabled_flow():
+    """端到端：关闭历史后不写盘也不显示；重新打开后写入自定义目录。"""
+    import tempfile
+    from pathlib import Path
+
+    import ui.app_window as aw
+
+    snap = MerchantSnapshot(
+        items=[MerchantItem("国王球", 160000, 1, rounds=(2,))],
+        status="open", round_index=2, expected_round=2,
+        source_label="测试渠道", fetched_at=datetime.now(),
+    )
+    original_fetch = aw.fetch_snapshot
+    aw.fetch_snapshot = lambda _config: (snap, [])
+    root = tk.Tk()
+    root.withdraw()
+    app = None
+    with tempfile.TemporaryDirectory() as folder:
+        cfg = Config()
+        cfg.history_enabled = False
+        cfg.history_dir = folder
+        cfg.notify_enabled = False
+        cfg.verify_egress = False
+        try:
+            app = aw.MerchantApp(root, cfg)
+            app._watcher.forget()
+            app._shelf_state_key = None
+
+            def pump_until(condition, timeout=12):
+                end = time.time() + timeout
+                while time.time() < end:
+                    root.update()
+                    time.sleep(0.01)
+                    if condition():
+                        return True
+                return False
+
+            ok = pump_until(lambda: app.snapshot is not None and bool(app._cards))
+            check("关闭历史后仍能正常查询", ok)
+            check("关闭历史后不写文件",
+                  not (Path(folder) / "history.json").exists())
+            check("关闭历史后没有历史面板", app._history_panel is None)
+
+            app.config.history_enabled = True
+            app.refresh(reason="手动刷新")
+            wrote = pump_until(lambda: (Path(folder) / "history.json").exists())
+            check("打开后写入自定义目录", wrote)
+            check("打开后有历史面板", app._history_panel is not None)
+        finally:
+            aw.fetch_snapshot = original_fetch
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
 
 
 def test_netdirect_proxy_strip():
@@ -2104,6 +2217,7 @@ def _run_all():
                test_history_store, test_purchase_marks, test_catalog_store,
                test_notify_item_selection, test_midnight_shelf,
                test_purchase_and_history_widgets, test_purchase_area_flow,
+               test_history_settings, test_history_disabled_flow,
                test_give_up_policy, test_publish_script,
                test_settings_recheck_fields,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,

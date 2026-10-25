@@ -30,8 +30,33 @@ KEEP_DAYS = 7        # 只保留最近 7 天
 MAX_ROUNDS = 28      # 7 天 × 4 轮
 
 
-def history_path() -> Path:
-    return app_dir() / "history.json"
+def history_path(directory: Path | None = None) -> Path:
+    """历史文件位置；``directory`` 为空表示默认目录（与配置同目录）。"""
+    return (directory or app_dir()) / "history.json"
+
+
+def migrate(source_dir: Path, target_dir: Path) -> bool:
+    """切换存放目录时把已有历史搬过去，搬不动就放弃（旧文件留在原处）。
+
+    只在"目标不存在"时搬，避免覆盖用户在新目录里已有的记录。
+    """
+    source = history_path(source_dir)
+    target = history_path(target_dir)
+    if source == target or not source.exists() or target.exists():
+        return False
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        source.replace(target)          # 同盘：原子重命名
+        return True
+    except OSError:
+        pass
+    try:
+        import shutil
+
+        shutil.move(str(source), str(target))   # 跨盘：复制后删除
+        return True
+    except (OSError, shutil.Error):
+        return False
 
 
 @dataclass(frozen=True)

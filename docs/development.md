@@ -179,7 +179,7 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `scripts/sync.bat` | `tools/publish.py` 的 Windows 一键入口（自测 → 提交 → 推送） |
 | `packaging/version_info.txt` | exe 文件版本资源，被 `app.spec` 的 `version=` 引用；**发版时要与 `APP_VERSION` 同步** |
 | `app.spec` | PyInstaller 配置。**新增数据文件必须加进 `datas`**（如 `data/cn_ipv4.txt`），否则打包后功能静默失效 |
-| `selftest.py` | 324 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
+| `selftest.py` | 339 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
 | `docs/development.md` | 本文档（开发交接、可配置项、同步流程），原 `DEVELOPMENT.md` |
 | `docs/cn-mirror.md` | 自建大陆反代（Nginx / 云函数两套配置） |
 | `docs/release-notes.md` | 当前版本的发布说明，`tools/release.py` 直接拿它当 Release 正文 |
@@ -223,7 +223,7 @@ scheduler 到点 / 用户点刷新
 %APPDATA%\RocoMerchant\
   config.json     用户配置（与源码运行共用同一份）
   state.json      通知去重 + 货架指纹
-  history.json    历史货架（最近 7 天，最多 28 轮）
+  history.json    历史货架（最近 7 天，最多 28 轮）；目录可改，见 7.3
   purchases.json  已购买标记（按 日期#轮次 分组，保留最近 60 轮）
   items.json      关注物品清单缓存（Wiki 刷新 / 本机观察 / 手动添加）
   logs\app.log    滚动日志
@@ -281,6 +281,8 @@ scheduler 到点 / 用户点刷新
 |---|---|---|---|---|
 | `notify_min_level` | 设置 → 通知提醒 | 3 稀有 / 4 史诗 / 5 传说 | 4 | 粗粒度筛选；达到等级就提醒 |
 | `notify_items` | 同上 →「关注物品」 | 任意物品名列表（上限 200） | 空 | **精确**筛选：不看品质，上架就提醒；与等级取并集。清单存在 `items.json`，可 Wiki 刷新 / 手动添加 |
+| `history_enabled` | 设置 →「历史记录」 | 开 / 关 | 开 | 关 = 不记录、不渲染历史面板（已有 `history.json` 保留）；关注物品清单不受影响 |
+| `history_dir` | 同上 → 存放目录 | 任意可写目录（留空 = 配置同目录） | 空 | 改目录时 `history.migrate()` 把旧文件搬过去；目录不可写则回退默认并提示 |
 
 两条规则是**并集**，不是替代：设了关注物品，原来的品质提醒照旧工作。
 关注清单之所以必须"可增长"，是因为 Wiki 没有完整的轮换货架（见第 2 章），
@@ -381,7 +383,7 @@ python tools\publish.py --push-only                 :: 只推送已有提交（�
 ```bat
 :: 运行时（根目录）
 python main.py                              :: 跑源码（需 Python 3.9+ 且含 tkinter）
-python selftest.py                          :: 324 项自测，应输出"失败 0 项"
+python selftest.py                          :: 339 项自测，应输出"失败 0 项"
 python -m compileall -q .                   :: 语法检查
 
 :: 脚本（scripts/ 下，双击或命令行均可）

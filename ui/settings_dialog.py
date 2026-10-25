@@ -89,6 +89,7 @@ class SettingsDialog(tk.Toplevel):
         self._build_notify(body)
         self._build_floating(body)
         self._build_cache(body)
+        self._build_history(body)
         self._build_logging(body)
         self._build_startup(body)
 
@@ -454,6 +455,74 @@ class SettingsDialog(tk.Toplevel):
         ).pack(fill="x", pady=(6, 0))
 
     # -------------------------------------------------------------- 缓存
+    def _build_history(self, master: tk.Misc) -> None:
+        holder = _section(master, "历史记录", "保留 7 天售卖记录，可关闭或换存放位置")
+
+        self._history_var = tk.BooleanVar(value=self._draft.history_enabled)
+        tk.Checkbutton(
+            holder, text="保留七天历史售卖记录", variable=self._history_var,
+            command=self._sync_history_state,
+            bg=SURFACE, fg=TEXT_DIM, activebackground=SURFACE, activeforeground=TEXT,
+            selectcolor=SURFACE_2, font=ui_font(9), bd=0, highlightthickness=0,
+        ).pack(anchor="w")
+
+        path_row = tk.Frame(holder, bg=SURFACE)
+        path_row.pack(fill="x", pady=(8, 0))
+        tk.Label(path_row, text="存放目录", bg=SURFACE, fg=TEXT_DIM, font=ui_font(9)).pack(
+            side="left", padx=(0, 10)
+        )
+        self._history_path_var = tk.StringVar(value=self._draft.history_dir)
+        self._history_entry = _entry(path_row, self._history_path_var, width=34)
+        self._history_entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self._history_browse = PillButton(
+            path_row, "浏览…", self._browse_history, style="subtle",
+            width=68, height=28, font_size=8,
+        )
+        self._history_browse.pack(side="left", padx=(8, 0))
+        self._history_reset = PillButton(
+            path_row, "默认", self._reset_history_path, style="subtle",
+            width=54, height=28, font_size=8,
+        )
+        self._history_reset.pack(side="left", padx=(6, 0))
+
+        self._history_hint = tk.Label(
+            holder, text=self._history_hint_text(True),
+            bg=SURFACE, fg=MUTED, font=ui_font(8), justify="left", wraplength=620,
+            anchor="w",
+        )
+        self._history_hint.pack(fill="x", pady=(6, 0))
+        self._sync_history_state()
+
+    def _sync_history_state(self) -> None:
+        """关闭时把目录相关控件一并灰掉，避免"改了却不生效"的困惑。"""
+        on = bool(self._history_var.get())
+        try:
+            self._history_entry.configure(state="normal" if on else "disabled")
+        except tk.TclError:
+            pass
+        self._history_browse.set_enabled(on)
+        self._history_reset.set_enabled(on)
+        self._history_hint.configure(text=self._history_hint_text(on))
+
+    @staticmethod
+    def _history_hint_text(enabled: bool) -> str:
+        """显式换行：靠 wraplength 自动折行会在"留空 ="后面断得很别扭。"""
+        if not enabled:
+            return "已关闭：不写盘、不显示历史区域，已有文件保留。"
+        return ("留空 = 与配置同目录（%APPDATA%\\RocoMerchant）。\n"
+                "关闭后不再记录、也不再显示历史区域；已有文件保留。")
+
+    def _browse_history(self) -> None:
+        folder = filedialog.askdirectory(
+            parent=self, title="选择历史记录存放目录",
+            initialdir=self._history_path_var.get() or str(self._cache.folder.parent),
+        )
+        if folder:
+            self._history_path_var.set(folder)
+
+    def _reset_history_path(self) -> None:
+        self._history_path_var.set("")
+
     def _build_cache(self, master: tk.Misc) -> None:
         holder = _section(master, "图标缓存", "位置可自定义，减少重复请求")
 
@@ -721,6 +790,8 @@ class SettingsDialog(tk.Toplevel):
         draft.recheck_delay_seconds = delay
         draft.recheck_max_attempts = attempts
         draft.notify_items = list(self._notify_items)
+        draft.history_enabled = bool(self._history_var.get())
+        draft.history_dir = self._history_path_var.get().strip()
         draft.recheck_give_up_policy = policy
         draft.recheck_slow_interval_seconds = slow_interval
         draft.recheck_slow_max_attempts = slow_max

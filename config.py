@@ -143,6 +143,23 @@ def cache_dir() -> Path:
     return default_cache_dir()
 
 
+def _as_bool(value, default: bool = True) -> bool:
+    """手工改配置时的布尔容错：`"false"` / `"0"` / `"off"` 都要认成 False。
+
+    直接用 bool() 会把字符串 "false" 判成 True——这正是"配置改了却不生效"的典型原因。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
 def resolve_icon_cache_dir(config: "Config") -> tuple[Path, str]:
     """按配置解析图标缓存目录。
 
@@ -170,6 +187,39 @@ def resolve_icon_cache_dir(config: "Config") -> tuple[Path, str]:
         return path, ""
     except (OSError, ValueError) as exc:
         return fallback, f"自定义缓存目录不可用（{type(exc).__name__}），已回退默认位置"
+
+
+def default_history_dir() -> Path:
+    """历史记录默认与配置同目录。"""
+    return app_dir()
+
+
+def resolve_history_dir(config: "Config") -> tuple[Path, str]:
+    """解析历史记录存放目录，返回 (目录, 提示)。
+
+    与图标缓存同款策略：相对路径按配置目录展开；目录建不出来或不可写就回退默认，
+    并给出可展示的提示——历史记不下来可以接受，程序因此崩溃不行。
+    """
+    raw = (getattr(config, "history_dir", "") or "").strip()
+    fallback = default_history_dir()
+    if not raw:
+        return fallback, ""
+
+    try:
+        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not path.is_absolute():
+            path = app_dir() / path
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_test"
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+        return path, ""
+    except (OSError, ValueError) as exc:
+        return fallback, f"历史目录不可用（{type(exc).__name__}），已回退默认位置"
 
 
 @dataclass
@@ -208,6 +258,10 @@ class Config:
     webhook_url: str = ""               # 可选：外部推送地址（Bark / 飞书 / 企业微信机器人等）
     # 点名关注：这些物品上架时**无视品质**提醒；与 notify_min_level 并行生效
     notify_items: list[str] = field(default_factory=list)
+
+    # 历史记录
+    history_enabled: bool = True        # 关闭后不再记录、也不再展示历史面板
+    history_dir: str = ""               # 空 = 与配置同目录；否则为自定义目录（绝对或相对）
 
     # 图标缓存
     icon_cache_enabled: bool = True
@@ -279,8 +333,8 @@ class Config:
                     "force_direct", "doh_enabled", "prefer_cn_region", "verify_egress",
                     "auto_recheck_after_refresh",
                     "floating_enabled", "floating_topmost", "floating_show_icons",
-                    "show_closed_message"):
-            setattr(cfg, key, bool(getattr(cfg, key)))
+                    "show_closed_message", "history_enabled"):
+            setattr(cfg, key, _as_bool(getattr(cfg, key)))
 
         # 清洗查询时间
         cfg.query_times = sanitize_times(cfg.query_times)
@@ -296,6 +350,9 @@ class Config:
         cfg.recheck_slow_interval_seconds = clamp_int(
             cfg.recheck_slow_interval_seconds, 300, 3600, 1800)
         cfg.recheck_slow_max_attempts = clamp_int(cfg.recheck_slow_max_attempts, 0, 20, 0)
+
+        # 历史目录：非字符串一律当成"默认位置"，避免 Path(123) 抛异常
+        cfg.history_dir = (cfg.history_dir if isinstance(cfg.history_dir, str) else "").strip()
 
         # 关注物品：手改配置写成字符串/数字/嵌套列表都不能让程序崩
         raw_watch = cfg.notify_items

@@ -33,8 +33,11 @@ class HistoryPanel(tk.Frame):
                  on_toggle: Optional[Callable[[bool], None]] = None) -> None:
         super().__init__(master, bg=BG)
         self._rounds: list[HistoryRound] = []
+        self._has_data = False
         self._loader = loader
         self._expanded = False
+        # 重绘时 constructor 会先于数据到达，先记住"用户想展开"，等数据来了再展开
+        self._want_expanded = bool(expanded)
         self._on_toggle = on_toggle
 
         self.header = tk.Frame(self, bg=BG, cursor="hand2")
@@ -48,9 +51,10 @@ class HistoryPanel(tk.Frame):
 
         # 展开/收起做成真正的按钮：原来只有一行小字，鼠标很难点到
         self._toggle_btn = PillButton(
-            self.header, "展开历史", self.toggle, style="subtle",
+            self.header, "暂无历史", self.toggle, style="subtle",
             width=104, height=30, font_size=9,
         )
+        self._toggle_btn.set_enabled(False)   # 有数据后才可点
         self._toggle_btn.pack(side="right", pady=(2, 2))
         self._count_hint = tk.Label(self.header, text="", bg=BG, fg=MUTED, font=ui_font(8))
         self._count_hint.pack(side="right", padx=(0, 10), pady=(3, 0))
@@ -59,25 +63,39 @@ class HistoryPanel(tk.Frame):
             widget.bind("<Button-1>", lambda _e: self.toggle())
 
         self._body = tk.Frame(self, bg=BG)
-        if expanded:                 # 重绘时保持用户上次的展开状态
-            self.toggle()
 
     # ------------------------------------------------------------------
     def set_rounds(self, rounds: Iterable[HistoryRound], current_key: str = "") -> None:
         """更新数据；折叠状态下只刷新标题，不重建列表。"""
         self._rounds = list(rounds)
+        self._has_data = bool(self._rounds)
         current = f" · 当前 {current_key.split('#')[-1]} 轮" if current_key else ""
         self._meta.configure(
-            text=f"{len(self._rounds)} 轮{current}" if self._rounds else "还没有记录"
+            text=f"{len(self._rounds)} 轮{current}" if self._has_data else "还没有记录"
         )
         self._count_hint.configure(
-            text=f"共 {sum(r.count for r in self._rounds)} 件" if self._rounds else ""
+            text=f"共 {sum(r.count for r in self._rounds)} 件" if self._has_data else ""
         )
+
+        # 没有历史数据时，展开控件直接禁用：点了也没内容，不该给出可点的暗示
+        self._toggle_btn.set_enabled(self._has_data)
+        if not self._has_data:
+            self._toggle_btn.set_text("暂无历史")
+            if self._expanded:
+                self._collapse()
+            return
+        if self._want_expanded and not self._expanded:
+            self.toggle()            # 数据到了，恢复用户上次的展开状态
+            return
+        self._toggle_btn.set_text("收起历史" if self._expanded else "展开历史")
         if self._expanded:
             self._rebuild()
 
     def toggle(self) -> None:
+        if not self._has_data:       # 没有数据时不展开，避免弹出空面板
+            return
         self._expanded = not self._expanded
+        self._want_expanded = self._expanded
         if self._on_toggle is not None:
             self._on_toggle(self._expanded)
         self._arrow.configure(text="▾" if self._expanded else "▸")
@@ -87,6 +105,14 @@ class HistoryPanel(tk.Frame):
             self._rebuild()
         else:
             self._body.pack_forget()
+
+    def _collapse(self) -> None:
+        self._expanded = False
+        self._want_expanded = False
+        self._arrow.configure(text="▸")
+        self._body.pack_forget()
+        if self._on_toggle is not None:
+            self._on_toggle(False)
 
     # ------------------------------------------------------------------
     def _rebuild(self) -> None:

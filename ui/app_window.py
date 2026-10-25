@@ -17,7 +17,8 @@ import monitors
 import netdirect
 import purchases
 import tray as tray_module
-from config import Config, resolve_icon_cache_dir, resource_path, state_path
+from config import (Config, resolve_history_dir, resolve_icon_cache_dir,
+                    resource_path, state_path)
 from freshness import (ACTION_NONE, CODE_ROUND_LAG, CODE_SHELF_SHRANK, ShelfObservation,
                        ShelfWatcher, format_delay)
 from models import MerchantSnapshot
@@ -44,6 +45,9 @@ class MerchantApp:
         self.root = root
         self.config = config
 
+        self.history_dir, self._history_warning = resolve_history_dir(config)
+        if self._history_warning:
+            applog.warning("历史目录 | %s", self._history_warning)
         self.cache_path, self._cache_warning = resolve_icon_cache_dir(config)
         self.cache = IconCache(self.cache_path, config.icon_cache_enabled)
         self.loader = ImageLoader(root, self.cache, ICON_SIZE)
@@ -845,7 +849,11 @@ class MerchantApp:
         )
 
     def _render_history(self, snapshot: MerchantSnapshot | None = None) -> None:
-        rounds = history.for_display()
+        if not self.config.history_enabled:
+            # 用户关掉了历史：不读盘、不建面板，界面里就彻底没有这一块
+            self._history_panel = None
+            return
+        rounds = history.for_display(self._history_file())
         key = self._round_key(snapshot) if snapshot is not None else ""
         panel = HistoryPanel(self.body, loader=self.loader,
                              expanded=self._history_expanded,
@@ -883,11 +891,19 @@ class MerchantApp:
         applog.info("购买标记 | %s | %s", item.name, "已购买" if state else "已取消")
         self._render(self.snapshot)
 
+    def _history_file(self):
+        return history.history_path(self.history_dir)
+
     def _record_history(self, snapshot: MerchantSnapshot) -> None:
-        """查询成功后落一条历史，并把本轮见过的商品并入通知清单。"""
+        """查询成功后落一条历史，并把本轮见过的商品并入通知清单。
+
+        历史被关掉时只是**不记录**；关注物品清单照旧累积，否则用户重新打开历史
+        会发现"这段时间见过的东西都没了"。两者是独立功能。
+        """
         try:
-            if history.record(snapshot) is not None:
-                catalog.observe(snapshot)
+            if self.config.history_enabled:
+                history.record(snapshot, path=self._history_file())
+            catalog.observe(snapshot)
         except Exception as exc:      # noqa: BLE001 - 记录失败不该影响查询结果
             applog.warning("历史记录失败 | %s", exc)
 
@@ -1180,6 +1196,17 @@ class MerchantApp:
             self.loader = ImageLoader(self.root, self.cache, ICON_SIZE)
             if copied:
                 self._cache_warning = f"已把 {copied} 张图标迁移到新目录"
+
+        # 历史目录 / 开关
+        new_history_dir, history_warning = resolve_history_dir(new_config)
+        if history_warning:
+            messagebox.showwarning("历史记录", history_warning, parent=self.root)
+        if new_history_dir != self.history_dir:
+            moved = history.migrate(self.history_dir, new_history_dir)
+            applog.info("历史目录已切换 -> %s（迁移旧记录=%s）", new_history_dir, moved)
+            self.history_dir = new_history_dir
+        if not new_config.history_enabled:
+            applog.info("历史记录已关闭（不再记录，也不展示历史面板）")
 
         # 开机自启：注册表与配置对齐
         if autostart.is_supported():
