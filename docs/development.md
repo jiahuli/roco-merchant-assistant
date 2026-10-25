@@ -31,7 +31,11 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
    | `shallow` | `124.226.74.51`（广西电信） | **是** | 需自备 Key（401 未授权即不可用） |
    | `cn_mirror` | 用户自建 | 是 | 见 `docs/cn-mirror.md` |
 
-5. **`onebiji` 页面的数据结构**（`parse_onebiji_html()` 的解析依据）：
+5. **Wiki 没有"本轮卖什么"**：`商店一览` 里 `#2002 远行商人` 只登记 1 件常驻商品，
+   正文提到"远行商人"的条目只有 3 个，`action=cargoquery` 不可用。所以「关注物品」清单
+   不能只靠 Wiki，见第 7.3 节与 `catalog.py`。
+
+6. **`onebiji` 页面的数据结构**（`parse_onebiji_html()` 的解析依据）：
    ```
    <li class="all_show li_show on show_1 show_2 show_3 show_4 "
        onclick="showShopinfo('<图标>','<名称>','<分类>','<描述>')">
@@ -129,6 +133,9 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `rarity.py` | 珍惜度五档推断（关键词 → 分类 → 价格三层），官方数据无此字段 |
 | `providers.py` | 7 个渠道实现（含页面解析）+ 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
 | `freshness.py` | 货架新鲜度判定（轮次落后 / 只剩全天商品 / 本轮商品消失），纯状态机，不碰 Tk |
+| `history.py` | 历史货架：按「日期 + 轮次」落盘，倒序读取，保留 7 天 / 28 轮，纯函数 |
+| `purchases.py` | 已购买标记：键 = 日期#轮次，换轮自动失效，纯函数 |
+| `catalog.py` | 关注物品清单：Wiki 抓取 + 本机观察 + 手动添加，图标优先缩略图 |
 | `netdirect.py` | 直连网络层：剥代理 / DoH / 按 IP 直连 / CN 段判定 / 出口诊断 / Clash 规则生成 |
 | `cache.py` | 图标两级缓存（磁盘 `sha1(url).png` + 内存 `PhotoImage`）+ 目录迁移 |
 | `scheduler.py` | 1 秒节拍，到点触发；`next_run()` 计算下一次 |
@@ -151,6 +158,8 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `ui/settings_dialog.py` | 设置面板（定时 / 渠道 / 网络直连 / 通知 / 悬浮窗 / 缓存 / 日志 / 启动） |
 | `ui/floating_window.py` | 置顶悬浮窗（拖动 / 收起 / 图标开关 / 多屏记忆） |
 | `ui/network_dialog.py` | 网络与出口诊断面板 |
+| `ui/history_panel.py` | 历史货架面板：默认折叠，展开后按时间倒序 |
+| `ui/item_picker.py` | 关注物品选择器：搜索、Wiki 更新、手动添加 |
 | `ui/log_viewer.py` | 日志查看器 |
 | `ui/widgets.py` | 自绘控件：`PillButton` / `ScrollFrame` / `StatBlock` / `ItemCard` / `RarityBadge` / `Tooltip` |
 | `ui/theme.py` | 颜色与字体（深色主题常量） |
@@ -160,6 +169,7 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | 文件 | 职责 |
 |---|---|
 | `data/cn_ipv4.txt` | 5499 条中国大陆 IPv4 段（APNIC 分配表，83KB），`is_cn_ip()` 用它 |
+| `data/merchant_items.json` | 关注物品的离线种子清单（Wiki 抓取 + 人工补录），被 `app.spec` 打进 exe |
 | `tools/build_cn_ranges.py` | 重新生成上表（`--source` 可用本地文件离线生成，结果可复现） |
 | `tools/publish.py` | **改动同步**：自测门禁 → 白名单收集 → 提交 → 推送（可选打 tag），见第 8 章 |
 | `tools/release.py` | 发布：建 Release、上传 exe、改固定名、归档旧版 |
@@ -169,7 +179,7 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `scripts/sync.bat` | `tools/publish.py` 的 Windows 一键入口（自测 → 提交 → 推送） |
 | `packaging/version_info.txt` | exe 文件版本资源，被 `app.spec` 的 `version=` 引用；**发版时要与 `APP_VERSION` 同步** |
 | `app.spec` | PyInstaller 配置。**新增数据文件必须加进 `datas`**（如 `data/cn_ipv4.txt`），否则打包后功能静默失效 |
-| `selftest.py` | 273 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
+| `selftest.py` | 324 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
 | `docs/development.md` | 本文档（开发交接、可配置项、同步流程），原 `DEVELOPMENT.md` |
 | `docs/cn-mirror.md` | 自建大陆反代（Nginx / 云函数两套配置） |
 | `docs/release-notes.md` | 当前版本的发布说明，`tools/release.py` 直接拿它当 Release 正文 |
@@ -196,10 +206,11 @@ scheduler 到点 / 用户点刷新
       → 通用 JSON 渠道：snapshot_from_payload() → build_items() 解析 rounds
       → verify_egress 时附一次 /cdn-cgi/trace 结果
   → 回主线程 _on_fetched()
-      → _render()            卡片 + 统计 + 滞后提示
+      → _record_history()      本轮落进 history.json，并把见过的商品并入 items.json
+      → _render()              在售区 + 已购买区 + 历史面板（含打烊清空）
       → _evaluate_freshness()  轮次落后 / 货架停滞则排程重试
       → _remember_shelf()      货架指纹落盘（冷启动也能比对）
-      → _maybe_notify()      达到珍惜度阈值且未推过 → 通知
+      → _maybe_notify()        品质达标 ∪ 关注物品，且本轮未推过 → 通知
 ```
 
 结果通过 `queue.Queue` 回主线程（**Tk 不允许跨线程操作控件**），由 `_pump_results()` 每 80ms 消费。
@@ -210,10 +221,13 @@ scheduler 到点 / 用户点刷新
 
 ```
 %APPDATA%\RocoMerchant\
-  config.json    用户配置（与源码运行共用同一份）
-  state.json     通知去重状态
-  logs\app.log   滚动日志
-  cache\icons\   默认图标缓存（可改）
+  config.json     用户配置（与源码运行共用同一份）
+  state.json      通知去重 + 货架指纹
+  history.json    历史货架（最近 7 天，最多 28 轮）
+  purchases.json  已购买标记（按 日期#轮次 分组，保留最近 60 轮）
+  items.json      关注物品清单缓存（Wiki 刷新 / 本机观察 / 手动添加）
+  logs\app.log    滚动日志
+  cache\icons\    默认图标缓存（可改）
 ```
 
 修改配置项的流程：`config.py` 加字段 → `load()` 里做类型清洗 → `settings_dialog` 加控件 + `_save()` 赋值 → README 配置表补一行。
@@ -261,7 +275,18 @@ scheduler 到点 / 用户点刷新
 切换策略不会污染状态机：`_exhausted`（同一内容"已放弃"标记）只在 `stop` 策略下生效，
 切到 `slow` 后自动让位给 `_slow_max` 计数；内容变化或换轮时两个计数一起清零。
 
-### 7.3 新增一个可配置项的固定套路
+### 7.3 通知与展示相关
+
+| 配置键 | 界面位置 | 可选范围 | 默认 | 选后对流程的影响 |
+|---|---|---|---|---|
+| `notify_min_level` | 设置 → 通知提醒 | 3 稀有 / 4 史诗 / 5 传说 | 4 | 粗粒度筛选；达到等级就提醒 |
+| `notify_items` | 同上 →「关注物品」 | 任意物品名列表（上限 200） | 空 | **精确**筛选：不看品质，上架就提醒；与等级取并集。清单存在 `items.json`，可 Wiki 刷新 / 手动添加 |
+
+两条规则是**并集**，不是替代：设了关注物品，原来的品质提醒照旧工作。
+关注清单之所以必须"可增长"，是因为 Wiki 没有完整的轮换货架（见第 2 章），
+只能靠 `catalog.observe()` 在每次查询时把实际出现的商品补进去。
+
+### 7.4 新增一个可配置项的固定套路
 
 1. `config.Config` 加字段（**给默认值，且默认 = 现有行为**）；
 2. `Config.load()` 做类型清洗：布尔 `bool()`、数字用 `clamp_int()` 夹取、枚举走白名单，非法值一律回落默认；
@@ -272,7 +297,20 @@ scheduler 到点 / 用户点刷新
 
 ## 8. 改动同步上传（GitHub）
 
-**"更新成功"的定义 = 自测通过 + 变更已推到 `origin/main`**，两步都做完才算完。
+> ### 🚦 发布门禁（硬规则，不得绕过）
+>
+> **只有维护者明确说"上传"（或"发版""推送"）时，才允许 `git push`、打 tag、创建 Release。**
+>
+> - 任何开发、修复、重构、构建、自测全部完成之后，**默认停在本地**，等指令；
+> - 不允许"顺手推一下""反正自测过了"这类自动同步；
+> - 版本号、release notes 可以先写好（它们只是文件），**推送与发布必须等人确认**；
+> - 一次确认只对一次上传有效，不覆盖后续改动；
+> - 违反本条的典型后果：未经复核的改动进了 `origin/main` 与 Latest Release，
+>   用户下载到的版本与维护者验收的版本不是同一个。
+>
+> 执行上传前先跑 `python tools/publish.py --dry-run`，把"将要提交/推送什么"贴给维护者看。
+
+**"更新成功"的定义 = 维护者确认 + 自测通过 + 变更已推到 `origin/main`**，三者齐了才算完。
 一条命令走完：
 
 ```bat
@@ -331,6 +369,9 @@ python tools\publish.py --push-only                 :: 只推送已有提交（�
 | **自测污染真实配置** | 测试改过的开关留在用户 config，看着像 bug | `preserve_app_files()` 备份还原 config/state + 注册表 |
 | **`rounds` 语义** | 条件球"一直在"被当成没刷新 | 它是 `(1,2,3,4)` 全天商品，正常 |
 | **`gh` 不在 PATH** | `tools/release.py` 报 `FileNotFoundError [WinError 2]`，发布中断（此时 Release 尚未创建） | 脚本已自动探测 `C:\Program Files\GitHub CLI`；新装 gh 后建议重开终端 |
+| **打烊后上游仍返回昨日货架** | 00:00 后界面还列着 20 点那轮，看起来像"正在补货" | 营业时间不需要请求就能确定：`providers` 在打烊时清空 `items` 并强制 `closed`，`_render()` 与悬浮窗再各兜一层 |
+| **渲染函数抛异常被 Tk 吞掉** | 界面停在旧状态、`selftest` 不是失败而是**卡住超时**（异常进了日志钩子） | 渲染路径只做展示，副作用（落盘/网络）放别处；出问题先看 `logs\app.log` 的"界面回调异常" |
+| **Wiki 没有轮换货架** | 想按物品选通知，却发现 Wiki 只有 1 件常驻商品 | 清单三路合并：Wiki 抓取 + 本机观察自动累积 + 手动添加；**不要**指望一次抓全 |
 | **价格里的简写单位** | `价格：16w` 被读成 16，界面显示"十六"、传说物品不再提醒 | `_to_int()` 认识 `万/w/亿/千/k`（`16w` → 160000）；页面价格正则要抓整段，别用 `[0-9]` 截断 |
 
 ---
@@ -340,7 +381,7 @@ python tools\publish.py --push-only                 :: 只推送已有提交（�
 ```bat
 :: 运行时（根目录）
 python main.py                              :: 跑源码（需 Python 3.9+ 且含 tkinter）
-python selftest.py                          :: 273 项自测，应输出"失败 0 项"
+python selftest.py                          :: 324 项自测，应输出"失败 0 项"
 python -m compileall -q .                   :: 语法检查
 
 :: 脚本（scripts/ 下，双击或命令行均可）
@@ -376,6 +417,7 @@ python tools\release.py --asset "dist\远行商人助手.exe" --notes-file docs\
 
 两项说明：
 
+- **先过发布门禁**：清单全绿也只是"可以发"，不是"已经发"。必须等维护者明确说"上传"。
 - **第 1 项是三处手写值**，最容易漏。当前没有脚本强制校验，所以放在清单第一位；
   真要根治，可在 `tools/publish.py` 的提交门禁里加一条"三处不一致就拒绝提交"。
 - **第 6 项不能用自测替代**：自测跑的是源码，exe 还多一层打包（隐藏导入、`datas`、清单资源）。
@@ -408,6 +450,9 @@ python tools\release.py --asset "dist\远行商人助手.exe" --notes-file docs\
 | 次数用完后的收尾方式 | 设置 →「定时查询」→ 次数用完后（`stop` / `slow`）→ `freshness.ShelfWatcher` |
 | 同步/推送流程 | `tools/publish.py`（排除规则、提交信息都在文件顶部） |
 | 新鲜度判据 | `freshness.ShelfWatcher.observe()` |
+| 历史保留天数 / 轮数 | `history.KEEP_DAYS` / `history.MAX_ROUNDS` |
+| 已购标记保留轮数 | `purchases.MAX_KEYS` |
+| 关注物品来源与上限 | `catalog.py` 顶部常量 + `fetch_wiki_items()` |
 | 珍惜度规则 | `rarity.py` 的 `RARITY_TABLE` 与关键词表 |
 | 通知内容 | `notifier._compose()` |
 | 卡片外观 | `ui/widgets.ItemCard` + `ui/theme.py` 颜色 |

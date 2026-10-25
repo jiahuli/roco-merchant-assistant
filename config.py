@@ -21,7 +21,7 @@ from typing import Any
 
 APP_NAME = "RocoMerchant"
 APP_TITLE = "远行商人助手"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 # ---------------------------------------------------------------------------
 # 各数据渠道的默认定义。base_url 全部可被用户在界面里覆盖。
@@ -206,6 +206,8 @@ class Config:
     notify_sound: bool = True           # 系统提示音
     notify_flash: bool = True           # 任务栏闪烁
     webhook_url: str = ""               # 可选：外部推送地址（Bark / 飞书 / 企业微信机器人等）
+    # 点名关注：这些物品上架时**无视品质**提醒；与 notify_min_level 并行生效
+    notify_items: list[str] = field(default_factory=list)
 
     # 图标缓存
     icon_cache_enabled: bool = True
@@ -294,6 +296,19 @@ class Config:
         cfg.recheck_slow_interval_seconds = clamp_int(
             cfg.recheck_slow_interval_seconds, 300, 3600, 1800)
         cfg.recheck_slow_max_attempts = clamp_int(cfg.recheck_slow_max_attempts, 0, 20, 0)
+
+        # 关注物品：手改配置写成字符串/数字/嵌套列表都不能让程序崩
+        raw_watch = cfg.notify_items
+        if isinstance(raw_watch, str):
+            raw_watch = [raw_watch]
+        if not isinstance(raw_watch, (list, tuple)):
+            raw_watch = []
+        cleaned: list[str] = []
+        for entry in raw_watch:
+            text = str(entry).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        cfg.notify_items = cleaned[:200]
 
         # 1.6.0：下掉英文镜像 rkw（更新慢 + 境外 Cloudflare），默认改用中文查询器。
         # 老配置里残留的 rkw 条目与 provider=rkw 都要迁移，否则会指向一个不存在的渠道。

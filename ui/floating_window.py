@@ -21,7 +21,7 @@ from ui.theme import (ACCENT, BG, BORDER, BORDER_HOVER, MUTED, MONEY, RARITY_COL
                       round_rect, ui_font)
 
 MAX_ROWS = 5
-HEADER_H = 34
+HEADER_H = 38
 ICON_PX = 18          # 行内物品图标尺寸
 
 
@@ -136,9 +136,10 @@ class FloatingWindow(tk.Toplevel):
         self._apply_size()
 
     def _icon_button(self, text: str, command: Callable[[], None], tip: str) -> tk.Label:
+        # width=3 + 内边距：点击区域从约 18px 提到约 30px，和标题栏高度匹配
         label = tk.Label(
-            self.header, text=text, bg=SURFACE_2, fg=MUTED, font=ui_font(9),
-            width=2, cursor="hand2",
+            self.header, text=text, bg=SURFACE_2, fg=MUTED, font=ui_font(11),
+            width=3, padx=3, pady=2, cursor="hand2",
         )
         label.bind("<Enter>", lambda _e: label.configure(bg=SURFACE_3, fg=TEXT))
         label.bind("<Leave>", lambda _e: label.configure(bg=SURFACE_2, fg=MUTED))
@@ -310,7 +311,9 @@ class FloatingWindow(tk.Toplevel):
 
     def _render(self, snapshot: MerchantSnapshot) -> None:
         self._clear_rows()
-        items = snapshot.items[:MAX_ROWS]
+        # 打烊后上游可能还挂着昨天 20 点那一轮，这里一律不列商品，
+        # 否则悬浮窗会成为"24 点后仍显示昨日货架"的漏网之处。
+        items = [] if snapshot.status == "closed" else snapshot.items[:MAX_ROWS]
 
         if snapshot.status == "closed":
             self.status_label.configure(text="已打烊", fg=MUTED)

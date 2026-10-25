@@ -195,6 +195,24 @@ def post_webhook(url: str, payload: dict, timeout: int = 8) -> None:
     threading.Thread(target=work, daemon=True).start()
 
 
+def select_targets(snapshot, min_level: int, watch: Iterable[str] = ()) -> list[MerchantItem]:
+    """选出该提醒的物品：**品质达标 ∪ 点名关注**，按名称去重并保持原顺序。
+
+    两条规则是并集而非替代关系——保留原来的粗粒度筛选，同时允许
+    "就要某一个普通品质的活动道具"这种精确诉求。
+    """
+    names = {str(n).strip() for n in watch if str(n).strip()}
+    picked: list[MerchantItem] = []
+    seen: set[str] = set()
+    for item in snapshot.items:
+        if item.name in seen:
+            continue
+        if item.rarity.level >= min_level or item.name in names:
+            seen.add(item.name)
+            picked.append(item)
+    return picked
+
+
 class Notifier:
     def __init__(self, root: tk.Misc, config: Config) -> None:
         self.root = root
@@ -221,7 +239,7 @@ class Notifier:
         if not items:
             return
         config = self.config
-        title, body = self._compose(items)
+        title, body = self._compose(items, config.notify_items)
 
         native_sent = False
         if config.notify_native and self._native_ok:
@@ -241,10 +259,13 @@ class Notifier:
 
     # ------------------------------------------------------------------
     @staticmethod
-    def _compose(items: list[MerchantItem]) -> tuple[str, str]:
+    def _compose(items: list[MerchantItem], watched: Iterable[str] = ()) -> tuple[str, str]:
+        watched_names = {str(n).strip() for n in watched if str(n).strip()}
         if len(items) == 1:
             first = items[0]
-            title = f"{first.rarity.label}物品：{first.name}"
+            # 点名关注的商品可能只是"普通"品质，标题直接说"关注物品"更清楚
+            prefix = "关注物品" if first.name in watched_names else f"{first.rarity.label}物品"
+            title = f"{prefix}：{first.name}"
             body = f"{first.price_text}（{first.price_raw_text or '价格未知'}）· {first.limit_text}"
             if first.category:
                 body += f" · {first.category}"
@@ -253,7 +274,8 @@ class Notifier:
         names = "、".join(item.name for item in items[:3])
         if len(items) > 3:
             names += f" 等 {len(items)} 件"
-        title = f"远行商人上架了 {len(items)} 件稀有物品"
+        tail = "关注物品" if any(i.name in watched_names for i in items) else "稀有物品"
+        title = f"远行商人上架了 {len(items)} 件{tail}"
         prices = " · ".join(item.price_text for item in items[:3])
         return title, f"{names}\n{prices}"
 

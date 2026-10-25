@@ -464,27 +464,37 @@ def parse_onebiji_html(page: str) -> list[MerchantItem]:
 
 
 def snapshot_from_items(items: list[MerchantItem], source_id: str, label: str,
-                        message: str = "") -> MerchantSnapshot:
+                        message: str = "",
+                        moment: datetime | None = None) -> MerchantSnapshot:
     """用"已经解析好的商品列表"拼快照（页面类渠道共用）。
 
     页面不报 `status` / `expectedRound` / `nextRefresh`，一律按本地时间推算；
     `expected_round` 与 `round_index` 取同一个值，因此不会误触发"轮次滞后"重试。
+
+    **打烊时必须清空货架**：数据源页面在 00:00 之后仍挂着昨天 20:00 那一轮，
+    `round_index_at()` 此时返回 0，`filter_by_round()` 见到 falsy 值会原样返回，
+    于是"24 点后还显示昨日商品"。这里直接以本地营业时间为准把 `items` 清掉。
+    ``moment`` 仅用于测试注入。
     """
-    moment = now_cn()
+    moment = moment or now_cn()
+    open_now = is_open_at(moment)
     round_index = round_index_at(moment)
-    kept, dropped = filter_by_round(items, round_index)
+    if open_now:
+        kept, dropped = filter_by_round(items, round_index)
+    else:
+        kept, dropped = [], list(items)
     return MerchantSnapshot(
         items=kept,
         source_id=source_id,
         source_label=label,
-        status=STATUS_OPEN if is_open_at(moment) else STATUS_CLOSED,
+        status=STATUS_OPEN if open_now else STATUS_CLOSED,
         round_index=round_index,
         expected_round=round_index,
         started_at=round_start_at(moment).strftime("%Y-%m-%d %H:%M"),
         next_refresh=next_refresh_at(moment).strftime("%Y-%m-%d %H:%M"),
         fetched_at=moment,
         dropped_count=len(dropped),
-        message=message,
+        message=message if open_now else "打烊中，货架已清空",
     )
 
 
@@ -666,9 +676,10 @@ class CustomProvider(BaseProvider):
         return snapshot
 
 
-def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantSnapshot:
-    """把未知结构的 JSON 尽力映射成快照。"""
-    moment = now_cn()
+def snapshot_from_payload(payload: Any, source_id: str, label: str,
+                          moment: datetime | None = None) -> MerchantSnapshot:
+    """把未知结构的 JSON 尽力映射成快照。``moment`` 仅用于测试注入。"""
+    moment = moment or now_cn()
     meta = payload if isinstance(payload, dict) else {}
     data = meta.get("data") if isinstance(meta.get("data"), dict) else meta
 
@@ -681,6 +692,12 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
         status = STATUS_CLOSED
     else:
         status = STATUS_OPEN if is_open_at(moment) else STATUS_CLOSED
+
+    # 打烊时段（含 00:00–08:00）：上游缓存经常仍报 open 并继续返回昨日 20 点那一轮。
+    # 营业时间是不需要请求就能确定的事实，以本地时间为准强制 closed，并把货架清空。
+    open_now = is_open_at(moment)
+    if not open_now:
+        status = STATUS_CLOSED
 
     next_refresh = _parse_dt(
         _first_value(meta, ("nextRefreshBeijing", "next_refresh_time", "nextRefresh", "next_refresh"))
@@ -695,7 +712,11 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
     expected_round = _to_int(
         _first_value(meta, ("expectedRound", "expected_round"))
     ) or round_index_at(moment)
-    items, dropped = filter_by_round(build_items(_find_items(payload)), round_index)
+    raw_items = build_items(_find_items(payload))
+    if open_now:
+        items, dropped = filter_by_round(raw_items, round_index)
+    else:
+        items, dropped = [], raw_items
 
     return MerchantSnapshot(
         items=items,
@@ -709,6 +730,7 @@ def snapshot_from_payload(payload: Any, source_id: str, label: str) -> MerchantS
         position=_first_value(meta, ("position", "merchant_pos", "location")),
         fetched_at=moment,
         dropped_count=len(dropped),
+        message="" if open_now else "打烊中，货架已清空",
     )
 
 

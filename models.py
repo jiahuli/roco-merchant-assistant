@@ -66,6 +66,53 @@ class MerchantItem:
         """用于去重/比对的指纹。"""
         return f"{self.name}|{self.price}|{self.limit}"
 
+    # ---------------------------------------------------------------- 落盘
+    def to_dict(self) -> dict:
+        """历史记录用：只存展示需要的字段，不含推断过程。"""
+        return {
+            "name": self.name,
+            "price": self.price,
+            "limit": self.limit,
+            "icon_url": self.icon_url,
+            "category": self.category,
+            "description": self.description,
+            "rounds": list(self.rounds),
+            "rarity": self.rarity.level,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MerchantItem":
+        """从历史记录还原；缺字段一律给安全默认值，绝不因旧数据抛异常。"""
+        from rarity import rarity_by_level
+
+        try:
+            price = data.get("price")
+            price = int(price) if price is not None else None
+        except (TypeError, ValueError):
+            price = None
+        try:
+            limit = data.get("limit")
+            limit = int(limit) if limit is not None else None
+        except (TypeError, ValueError):
+            limit = None
+
+        rounds: tuple[int, ...] = ()
+        raw_rounds = data.get("rounds") or []
+        if isinstance(raw_rounds, (list, tuple)):
+            rounds = tuple(sorted({int(r) for r in raw_rounds
+                                   if isinstance(r, (int, float)) and int(r) > 0}))
+
+        return cls(
+            name=str(data.get("name") or ""),
+            price=price,
+            limit=limit,
+            icon_url=str(data.get("icon_url") or ""),
+            category=str(data.get("category") or ""),
+            description=str(data.get("description") or ""),
+            rounds=rounds,
+            rarity=rarity_by_level(int(data.get("rarity") or 1)),
+        )
+
 
 @dataclass
 class MerchantSnapshot:

@@ -14,6 +14,7 @@ from config import QUERY_TIME_PRESETS, Config, resolve_icon_cache_dir, sanitize_
 from freshness import GIVE_UP_POLICIES, POLICY_SLOW, POLICY_STOP
 from rarity import RARITY_TABLE
 from ui import theme
+from ui.item_picker import ItemPickerDialog
 from ui.theme import (ACCENT, BG, BORDER, BORDER_HOVER, DANGER, MUTED, SURFACE,
                       SURFACE_2, TEXT, TEXT_DIM, WARNING, mix, round_rect, ui_font)
 from ui.widgets import PillButton, ScrollFrame
@@ -385,6 +386,29 @@ class SettingsDialog(tk.Toplevel):
                 font=ui_font(9), bd=0, highlightthickness=0,
             ).pack(side="left", padx=(0, 12))
 
+        watch_row = tk.Frame(holder, bg=SURFACE)
+        watch_row.pack(fill="x", pady=(10, 0))
+        tk.Label(watch_row, text="关注物品", bg=SURFACE, fg=TEXT_DIM, font=ui_font(9)).pack(
+            side="left", padx=(0, 10)
+        )
+        self._notify_items = list(self._draft.notify_items)
+        self._watch_label = tk.Label(
+            watch_row, text=self._watch_text(), bg=SURFACE, fg=MUTED,
+            font=ui_font(9), anchor="w",
+        )
+        self._watch_label.pack(side="left", fill="x", expand=True)
+        PillButton(watch_row, "选择…", self._open_item_picker, style="subtle",
+                   width=68, height=26, font_size=8).pack(side="right")
+        PillButton(watch_row, "清空", self._clear_watch, style="subtle",
+                   width=54, height=26, font_size=8).pack(side="right", padx=(0, 6))
+
+        tk.Label(
+            holder,
+            text="勾选的物品不看品质，上架就提醒；「提醒等级」仍然有效（两条规则并行）。"
+                 "清单来自 Wiki + 本机见过的商品，可在选择器里手动添加新道具。",
+            bg=SURFACE, fg=MUTED, font=ui_font(8), justify="left", wraplength=580,
+        ).pack(fill="x", pady=(4, 0))
+
         hook_row = tk.Frame(holder, bg=SURFACE)
         hook_row.pack(fill="x", pady=(12, 0))
         tk.Label(hook_row, text="外部推送", bg=SURFACE, fg=TEXT_DIM, font=ui_font(9)).pack(
@@ -594,6 +618,25 @@ class SettingsDialog(tk.Toplevel):
             holder, text=note, bg=SURFACE, fg=MUTED, font=ui_font(8), anchor="w",
         ).pack(fill="x", pady=(6, 0))
 
+    def _watch_text(self) -> str:
+        if not self._notify_items:
+            return "未选择（仅按提醒等级）"
+        preview = "、".join(self._notify_items[:4])
+        if len(self._notify_items) > 4:
+            preview += f" 等 {len(self._notify_items)} 件"
+        return preview
+
+    def _open_item_picker(self) -> None:
+        dialog = ItemPickerDialog(self, self._notify_items, self._cache)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            self._notify_items = list(dialog.result)
+            self._watch_label.configure(text=self._watch_text())
+
+    def _clear_watch(self) -> None:
+        self._notify_items = []
+        self._watch_label.configure(text=self._watch_text())
+
     def _test_notify(self) -> None:
         ok = notifier_native.send("通知测试", "出现稀有物品时，就会像这样提醒你。")
         self._notify_hint.configure(
@@ -677,6 +720,7 @@ class SettingsDialog(tk.Toplevel):
         draft.auto_recheck_after_refresh = bool(self._recheck_var.get())
         draft.recheck_delay_seconds = delay
         draft.recheck_max_attempts = attempts
+        draft.notify_items = list(self._notify_items)
         draft.recheck_give_up_policy = policy
         draft.recheck_slow_interval_seconds = slow_interval
         draft.recheck_slow_max_attempts = slow_max

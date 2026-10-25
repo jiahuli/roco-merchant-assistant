@@ -11,18 +11,23 @@ import tkinter as tk
 from cache import ICON_SIZE, IconCache, ImageLoader, has_pillow, migrate_cache
 import applog
 import autostart
+import catalog
+import history
 import monitors
 import netdirect
+import purchases
 import tray as tray_module
 from config import Config, resolve_icon_cache_dir, resource_path, state_path
 from freshness import (ACTION_NONE, CODE_ROUND_LAG, CODE_SHELF_SHRANK, ShelfObservation,
                        ShelfWatcher, format_delay)
 from models import MerchantSnapshot
-from notifier import Notifier
-from providers import CN_TZ, ProviderError, fetch_snapshot, next_refresh_at
+from notifier import Notifier, select_targets
+from providers import (CN_TZ, ProviderError, fetch_snapshot, is_open_at,
+                       next_refresh_at)
 from rarity import RARITY_TABLE
 from scheduler import Scheduler, format_countdown, format_delta
 from ui.floating_window import FloatingWindow
+from ui.history_panel import HistoryPanel
 from ui.settings_dialog import SettingsDialog
 from ui.theme import (ACCENT, BG, BORDER, DANGER, MUTED, SUCCESS, SURFACE, SURFACE_2,
                       TEXT, TEXT_DIM, WARNING, mono_font, ui_font)
@@ -73,6 +78,11 @@ class MerchantApp:
         self.floating: FloatingWindow | None = None
         self._loading = False
         self._cards: list[ItemCard] = []
+        self._bought_cards: list[ItemCard] = []
+        self._bought_grid: tk.Frame | None = None
+        self._bought_count: tk.Label | None = None
+        self._history_panel: HistoryPanel | None = None
+        self._history_expanded = False
         self._columns = 0
         self._resize_job: str | None = None
         self._countdown_target: datetime | None = None
@@ -468,6 +478,7 @@ class MerchantApp:
             applog.warning("出口不在中国大陆（%s/%s），流量已由代理接管；"
                            "建议改用大陆反代渠道或在路由器侧加 DIRECT 规则",
                            egress.get("country"), egress.get("colo", "?"))
+        self._record_history(snapshot)
         self._render(snapshot)
         if errors:
             self.status_left.configure(
@@ -683,8 +694,11 @@ class MerchantApp:
         """清空内容区；货架容器按需重建（clear() 会连它一起销毁）。"""
         self._scroll.clear()
         self._cards.clear()
+        self._bought_cards.clear()
         self._columns = 0
         self._grid = None
+        self._bought_grid = None
+        self._history_panel = None
 
     def _ensure_grid(self) -> tk.Frame:
         if self._grid is None or not self._grid.winfo_exists():
@@ -703,36 +717,48 @@ class MerchantApp:
     def _render(self, snapshot: MerchantSnapshot) -> None:
         self._reset_content()
 
-        opened = snapshot.is_open and bool(snapshot.items)
+        # 跨日防御：数据源在 00:00 之后仍可能挂着昨天 20 点那一轮，
+        # 甚至把 status 继续报成 open。营业时间是不用请求就能确定的事实，
+        # 所以这里再兜一层——打烊后的界面绝不出现昨日商品。
+        live = is_open_at(datetime.now(CN_TZ))
+        items = list(snapshot.items) if live else []
+        bought = self._bought_names(snapshot) if live else set()
+        pending = [item for item in items if item.name not in bought]
+        purchased = [item for item in items if item.name in bought]
+
+        opened = snapshot.is_open and bool(items)
+        closed_now = snapshot.status == "closed" or not live
         if opened:
             self.pill.set_state("营业中", SUCCESS)
-        elif snapshot.status == "closed":
+        elif closed_now:
             self.pill.set_state("已打烊", MUTED)
         else:
             self.pill.set_state("暂无商品", WARNING)
 
         self.stat_round.set_value(f"第 {snapshot.round_index} 轮" if snapshot.round_index else "—")
-        self.stat_items.set_value(f"{len(snapshot.items)} 件")
+        self.stat_items.set_value(f"{len(items)} 件")
 
         # 倒计时目标：营业中盯"下一轮换货"，打烊时盯"下次出摊"
         now_cn = datetime.now(CN_TZ)
-        if snapshot.status == "closed":
+        if closed_now:
             self._countdown_target = self._next_open(now_cn)
             self.countdown_hint.configure(text="距离商人出摊")
         else:
             self._countdown_target = self._parse_refresh(snapshot)
             self.countdown_hint.configure(text="距离下一轮换货")
 
-        self._sync_floating(snapshot)
+        # 悬浮窗也要拿到"打烊后清空"的视图，否则它还会列出昨日商品
+        self._sync_floating(snapshot if live else self._closed_view(snapshot))
 
         if not opened:
-            if snapshot.status == "closed":
+            if closed_now:
                 open_at = self._next_open(now_cn)
                 day_text = "今天" if open_at.date() == now_cn.date() else "明天"
                 self._show_placeholder(
                     "商人已打烊",
                     "远行商人每天 08:00 开始营业，00:00 - 08:00 不出摊。\n"
-                    f"下一次出现：{day_text} {open_at.strftime('%H:%M')}",
+                    f"下一次出现：{day_text} {open_at.strftime('%H:%M')}\n"
+                    "打烊期间不显示上一轮的货架。",
                     accent=MUTED,
                 )
             else:
@@ -741,6 +767,7 @@ class MerchantApp:
                     "接口没有返回本轮的货架数据，可能是商人正在换货，稍后刷新试试。",
                     accent=WARNING,
                 )
+            self._render_history(snapshot)
             self._update_status_right()
             self._update_net_status()      # 打烊时也要显示出口，否则状态栏是空的
             self._sync_tray_tooltip()
@@ -748,14 +775,16 @@ class MerchantApp:
 
         grid = self._ensure_grid()
         level = self.config.notify_min_level
-        special = len(snapshot.above_level(level))
+        special = sum(1 for item in items if item.rarity.level >= level)
         label = RARITY_TABLE.get(level, RARITY_TABLE[4]).label
-        shelf_text = f"共 {len(snapshot.items)} 件"
+        shelf_text = f"共 {len(items)} 件"
         if special:
             shelf_text += f" · {label}及以上 {special} 件"
-        all_day = snapshot.all_day_count
+        all_day = sum(1 for item in items if item.is_all_day)
         if all_day:
             shelf_text += f" · 其中 {all_day} 件全天在售"
+        if purchased:
+            shelf_text += f" · 已购 {len(purchased)} 件"
         self._shelf_count.configure(text=shelf_text)
 
         if snapshot.is_round_lagging:
@@ -768,15 +797,99 @@ class MerchantApp:
                     if self._countdown_target else "")
             self._shelf_note.configure(text=note, fg=MUTED)
 
-        for index, item in enumerate(snapshot.items):
-            card = ItemCard(grid, item, self.loader, index)
-            self._cards.append(card)
+        for index, item in enumerate(pending):
+            self._cards.append(
+                ItemCard(grid, item, self.loader, index, on_toggle=self._toggle_purchased)
+            )
+
+        if purchased:
+            bought_grid = self._ensure_bought_grid()
+            if self._bought_count is not None:
+                self._bought_count.configure(text=f"{len(purchased)} 件")
+            for index, item in enumerate(purchased):
+                self._bought_cards.append(ItemCard(
+                    bought_grid, item, self.loader, index,
+                    purchased=True, on_toggle=self._toggle_purchased,
+                ))
 
         self._layout_cards(force=True)
+        self._render_history(snapshot)
         self._update_status_right()
         self._update_cache_label()
         self._update_net_status()
         self._sync_tray_tooltip()
+
+    # ------------------------------------------------------- 分区 / 历史
+    def _ensure_bought_grid(self) -> tk.Frame:
+        """「已购买」独立区域：与在售区分开，避免已买的还占着最显眼的位置。"""
+        if self._bought_grid is None or not self._bought_grid.winfo_exists():
+            head = tk.Frame(self.body, bg=BG)
+            head.pack(fill="x", padx=26, pady=(10, 2))
+            tk.Label(head, text="已购买", bg=BG, fg=TEXT,
+                     font=ui_font(10, "bold")).pack(side="left")
+            self._bought_count = tk.Label(head, text="", bg=BG, fg=MUTED, font=ui_font(9))
+            self._bought_count.pack(side="left", padx=(8, 0), pady=(1, 0))
+            tk.Label(head, text="点「已购」可撤销", bg=BG, fg=MUTED,
+                     font=ui_font(8)).pack(side="right", pady=(2, 0))
+            self._bought_grid = tk.Frame(self.body, bg=BG)
+            self._bought_grid.pack(fill="both", expand=True, padx=20, pady=(2, 8))
+        return self._bought_grid
+
+    def _closed_view(self, snapshot: MerchantSnapshot) -> MerchantSnapshot:
+        """给悬浮窗用的"打烊视图"：清空货架，不修改原快照。"""
+        return MerchantSnapshot(
+            items=[], source_id=snapshot.source_id, source_label=snapshot.source_label,
+            status="closed", round_index=snapshot.round_index,
+            next_refresh=snapshot.next_refresh, fetched_at=snapshot.fetched_at,
+            message="打烊中，货架已清空",
+        )
+
+    def _render_history(self, snapshot: MerchantSnapshot | None = None) -> None:
+        rounds = history.for_display()
+        key = self._round_key(snapshot) if snapshot is not None else ""
+        panel = HistoryPanel(self.body, loader=self.loader,
+                             expanded=self._history_expanded,
+                             on_toggle=self._on_history_toggle)
+        panel.pack(fill="x", pady=(4, 18))
+        panel.set_rounds(rounds, current_key=key)
+        self._history_panel = panel
+
+    def _on_history_toggle(self, expanded: bool) -> None:
+        """记住展开状态：每次查询都会重绘，不记住的话一展开就又被收起来。"""
+        self._history_expanded = bool(expanded)
+
+    def _round_key(self, snapshot: MerchantSnapshot) -> str:
+        moment = snapshot.fetched_at
+        if moment.tzinfo is None:          # 老快照/测试桩可能是 naive 时间
+            moment = moment.replace(tzinfo=CN_TZ)
+        return purchases.round_key(snapshot, moment.astimezone(CN_TZ))
+
+    def _bought_names(self, snapshot: MerchantSnapshot) -> set[str]:
+        try:
+            return purchases.bought_names(self._round_key(snapshot))
+        except Exception:      # noqa: BLE001 - 读盘失败不该让界面打不开
+            return set()
+
+    def _toggle_purchased(self, item) -> None:
+        """勾选/取消已购：落盘后整体重绘，物品自动在两个区域之间移动。"""
+        if self.snapshot is None:
+            return
+        key = self._round_key(self.snapshot)
+        try:
+            state = purchases.toggle(key, item.name)
+        except Exception as exc:      # noqa: BLE001
+            applog.warning("购买标记失败 | %s | %s", item.name, exc)
+            return
+        applog.info("购买标记 | %s | %s", item.name, "已购买" if state else "已取消")
+        self._render(self.snapshot)
+
+    def _record_history(self, snapshot: MerchantSnapshot) -> None:
+        """查询成功后落一条历史，并把本轮见过的商品并入通知清单。"""
+        try:
+            if history.record(snapshot) is not None:
+                catalog.observe(snapshot)
+        except Exception as exc:      # noqa: BLE001 - 记录失败不该影响查询结果
+            applog.warning("历史记录失败 | %s", exc)
 
     def _render_error(self, message: str) -> None:
         self._reset_content()
@@ -812,7 +925,7 @@ class MerchantApp:
 
     def _layout_cards(self, force: bool = False) -> None:
         self._resize_job = None
-        if not self._cards or self._grid is None:
+        if not self._cards and not self._bought_cards:
             return
         width = self._scroll.canvas.winfo_width() or 1100
         columns = max(1, min(4, (width - 40) // 340))
@@ -820,14 +933,18 @@ class MerchantApp:
             return
         self._columns = columns
 
-        for column in range(5):
-            self._grid.columnconfigure(column, weight=1 if column < columns else 0,
-                                       uniform="cards" if column < columns else "")
-        for index, card in enumerate(self._cards):
-            card.grid(
-                row=index // columns, column=index % columns,
-                sticky="nsew", padx=6, pady=6,
-            )
+        for cards, grid in ((self._cards, self._grid),
+                            (self._bought_cards, self._bought_grid)):
+            if grid is None or not cards:
+                continue
+            for column in range(5):
+                grid.columnconfigure(column, weight=1 if column < columns else 0,
+                                     uniform="cards" if column < columns else "")
+            for index, card in enumerate(cards):
+                card.grid(
+                    row=index // columns, column=index % columns,
+                    sticky="nsew", padx=6, pady=6,
+                )
 
     # ------------------------------------------------------------------ 时间
     @staticmethod
@@ -909,7 +1026,9 @@ class MerchantApp:
     def _maybe_notify(self, snapshot: MerchantSnapshot) -> None:
         if not self.config.notify_enabled:
             return
-        specials = snapshot.above_level(self.config.notify_min_level)
+        # 两条规则并行：品质达标照旧提醒；关注清单里的物品不看品质
+        specials = select_targets(snapshot, self.config.notify_min_level,
+                                  self.config.notify_items)
         if not specials:
             return
 

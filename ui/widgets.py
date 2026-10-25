@@ -149,18 +149,20 @@ class ItemCard(tk.Frame):
     """一行商品：图标 / 名称 / 珍惜度 / 中文价格 / 限购。"""
 
     def __init__(self, master: tk.Misc, item: MerchantItem, loader: ImageLoader,
-                 index: int = 0) -> None:
+                 index: int = 0, purchased: bool = False,
+                 on_toggle: Optional[Callable[[MerchantItem], None]] = None) -> None:
         super().__init__(
             master, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1, bd=0,
         )
         self.item = item
         self.loader = loader
+        self.purchased = purchased
+        self._on_toggle = on_toggle
         self._photo: Optional[tk.PhotoImage] = None
 
-        # 左侧珍惜度色条
-        tk.Frame(self, bg=RARITY_COLORS.get(item.rarity.level, MUTED), width=3).pack(
-            side="left", fill="y"
-        )
+        # 左侧珍惜度色条（已购买时压暗，避免抢注意力）
+        tk.Frame(self, bg=MUTED if purchased else RARITY_COLORS.get(item.rarity.level, MUTED),
+                 width=3).pack(side="left", fill="y")
 
         inner = tk.Frame(self, bg=SURFACE)
         inner.pack(side="left", fill="both", expand=True, padx=12, pady=10)
@@ -185,6 +187,32 @@ class ItemCard(tk.Frame):
         head = tk.Frame(body, bg=SURFACE)
         head.pack(fill="x")
 
+        # 已购买勾选：只用一个小标签，不引入新的边框/布局层级
+        if on_toggle is not None:
+            normal_bg = SURFACE_2
+            self.toggle_btn = tk.Label(
+                head,
+                text="✓ 已购" if purchased else "○ 标记",
+                bg=mix(theme.SUCCESS, SURFACE, 0.82) if purchased else normal_bg,
+                fg=theme.SUCCESS if purchased else TEXT_DIM,
+                font=ui_font(9, "bold"), padx=12, pady=5, cursor="hand2",
+            )
+            self.toggle_btn.pack(side="right", padx=(0, 8), pady=(0, 1))
+            self.toggle_btn.bind("<Button-1>", self._toggle_purchased)
+            # 悬停反馈：让它看起来是可点的按钮，而不是一行说明文字
+            self.toggle_btn.bind(
+                "<Enter>", lambda _e: self.toggle_btn.configure(
+                    bg=SURFACE_3 if not self.purchased
+                    else mix(theme.SUCCESS, SURFACE, 0.7))
+            )
+            self.toggle_btn.bind(
+                "<Leave>", lambda _e: self.toggle_btn.configure(
+                    bg=normal_bg if not self.purchased
+                    else mix(theme.SUCCESS, SURFACE, 0.82))
+            )
+            Tooltip(self.toggle_btn,
+                    "取消已购标记" if purchased else "标记为已购买，会移到下方「已购买」区域")
+
         # 全天在售角标：解释"为什么换货后这件还在"，避免误认为没刷新
         if item.is_all_day:
             tk.Label(
@@ -194,7 +222,8 @@ class ItemCard(tk.Frame):
 
         RarityBadge(head, item, bg=SURFACE).pack(side="right")
         self.name_label = tk.Label(
-            head, text=item.name, bg=SURFACE, fg=TEXT, font=ui_font(11, "bold"),
+            head, text=item.name, bg=SURFACE,
+            fg=MUTED if purchased else TEXT, font=ui_font(11, "bold"),
             anchor="w", justify="left",
         )
         self.name_label.pack(side="left", fill="x", expand=True)
@@ -208,7 +237,8 @@ class ItemCard(tk.Frame):
         price_row = tk.Frame(body, bg=SURFACE)
         price_row.pack(fill="x", pady=(7, 0))
         tk.Label(
-            price_row, text=item.price_text, bg=SURFACE, fg=MONEY,
+            price_row, text=item.price_text, bg=SURFACE,
+            fg=MUTED if purchased else MONEY,
             font=ui_font(15, "bold"), anchor="w",
         ).pack(side="left")
         if item.price_raw_text:
@@ -233,6 +263,12 @@ class ItemCard(tk.Frame):
         yield widget
         for child in widget.winfo_children():
             yield from ItemCard._walk(child)
+
+    def _toggle_purchased(self, _event=None) -> str:
+        """点击「标记 / 已购」；实际状态由主窗口统一落盘并重绘。"""
+        if self._on_toggle is not None:
+            self._on_toggle(self.item)
+        return "break"
 
     def _on_enter(self, _event=None) -> None:
         if not self._hovered:

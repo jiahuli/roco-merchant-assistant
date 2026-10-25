@@ -23,7 +23,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[("assets/app.ico", "assets"),
-           ("data/cn_ipv4.txt", "data")],
+           ("data/cn_ipv4.txt", "data"),
+           # 关注物品的离线种子清单；漏了它 exe 里的选择器会只剩"本机见过"的条目
+           ("data/merchant_items.json", "data")],
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},

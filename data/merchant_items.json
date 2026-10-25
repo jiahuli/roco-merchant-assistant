@@ -1,0 +1,31 @@
+{
+ "note": "远行商人可售卖物品的离线种子清单（Wiki 抓取，含人工补录的限时活动道具）",
+ "generated_at": "2026-10-25",
+ "items": [
+  {
+   "name": "可可果",
+   "icon": "",
+   "source": "Wiki"
+  },
+  {
+   "name": "炫彩精灵蛋",
+   "icon": "https://patchwiki.biligame.com/images/rocom/0/0d/gkijb43j6tp5kadtksuux84zwrrawua.png",
+   "source": "Wiki"
+  },
+  {
+   "name": "神奇的蛋",
+   "icon": "https://patchwiki.biligame.com/images/rocom/0/0d/gkijb43j6tp5kadtksuux84zwrrawua.png",
+   "source": "Wiki"
+  },
+  {
+   "name": "赛季炫彩精灵蛋",
+   "icon": "https://patchwiki.biligame.com/images/rocom/0/0d/gkijb43j6tp5kadtksuux84zwrrawua.png",
+   "source": "Wiki"
+  },
+  {
+   "name": "可可果球",
+   "icon": "https://patchwiki.biligame.com/images/rocom/d/d2/t2rpfj5xsrcxxwnwkrh43f3nczmt59f.png",
+   "source": "Wiki"
+  }
+ ]
+}

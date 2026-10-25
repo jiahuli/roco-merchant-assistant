@@ -31,7 +31,11 @@ def preserve_app_files():
     （比如 close_to_tray=false）会留在用户真实配置里，看起来很像是程序 bug。
     """
     backups = {}
-    for path in (config_path(), state_path()):
+    # 新增的 history / purchases / items 三个文件同样是"用户真实数据"，
+    # 测试会往里写历史与勾选，不备份就会污染用户目录。
+    extra = [config_path().parent / name
+             for name in ("history.json", "purchases.json", "items.json")]
+    for path in (config_path(), state_path(), *extra):
         try:
             backups[path] = path.read_bytes() if path.exists() else None
         except OSError:
@@ -1439,6 +1443,344 @@ def test_floating_refresh_while_hidden():
             pass
 
 
+def test_history_store():
+    """历史：倒序、保留全天商品、同轮去重、跨天清理。"""
+    import tempfile
+    from datetime import timedelta, timezone
+    from pathlib import Path
+
+    import history
+
+    CN = timezone(timedelta(hours=8))
+    all_day = MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
+
+    def snapshot(round_no, names, moment):
+        items = [all_day] + [MerchantItem(n, 1000 * (i + 1), 1, rounds=(round_no,))
+                             for i, n in enumerate(names)]
+        return MerchantSnapshot(items=items, status="open", round_index=round_no,
+                                fetched_at=moment)
+
+    def at(hour, day=25):
+        return datetime(2026, 10, day, hour, 5, tzinfo=CN)
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "history.json"
+        # 先塞一条十天前的记录，验证后续写入时会被清理
+        history.record(snapshot(1, ["十天前的货"], at(8, day=15)),
+                       path=path, now=at(8, day=15))
+
+        round_of = {8: 1, 12: 2, 16: 3, 20: 4}
+        for hour, names in ((12, ["午间货"]), (20, ["晚间货"]),
+                            (8, ["早间货"]), (16, ["午后货"])):
+            history.record(snapshot(round_of[hour], names, at(hour)),
+                           path=path, now=at(hour))
+
+        rounds = history.load(path)
+        check("历史按时间倒序", [r.round_index for r in rounds] == [4, 3, 2, 1],
+              str([r.round_index for r in rounds]))
+        check("历史钟点正确",
+              [r.clock for r in rounds] == ["20:00", "16:00", "12:00", "08:00"],
+              str([r.clock for r in rounds]))
+        check("历史保留全天商品",
+              all(any(i.is_all_day for i in r.items) for r in rounds))
+
+        # 同一轮再查一次：更新内容而不是追加一条
+        history.record(snapshot(4, ["晚间货", "新上架"], at(20)), path=path, now=at(20))
+        rounds = history.load(path)
+        check("同一轮只留一条", len(rounds) == 4, str(len(rounds)))
+        check("同轮内容会被更新",
+              any(i.name == "新上架" for i in rounds[0].items))
+
+        # 打烊空快照不进历史
+        closed = MerchantSnapshot(items=[all_day], status="closed", round_index=0,
+                                  fetched_at=at(20))
+        check("打烊快照不入历史", history.record(closed, path=path, now=at(20)) is None)
+
+        rounds = history.load(path)
+        check("超期历史被清理", all(r.date == "2026-10-25" for r in rounds),
+              str({r.date for r in rounds}))
+        check("清理后仍是 4 轮", len(rounds) == 4, str(len(rounds)))
+
+
+def test_purchase_marks():
+    """购买标记：按轮次记录、可切换、清空后归零。"""
+    import tempfile
+    from datetime import timedelta, timezone
+    from pathlib import Path
+
+    import purchases
+
+    CN = timezone(timedelta(hours=8))
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "purchases.json"
+        key = "2026-10-25#3"
+        check("初始未购买", not purchases.is_bought(key, "国王球", path))
+        check("勾选返回新状态", purchases.toggle(key, "国王球", path) is True)
+        check("勾选已落盘", purchases.is_bought(key, "国王球", path))
+        check("再次点击取消", purchases.toggle(key, "国王球", path) is False)
+        check("取消后不再记录", not purchases.is_bought(key, "国王球", path))
+
+        purchases.mark(key, "网兜球", True, path)
+        check("已购计数", purchases.count(key, path) == 1, str(purchases.count(key, path)))
+        purchases.clear_round(key, path)
+        check("清空本轮", purchases.count(key, path) == 0)
+
+        moment = datetime(2026, 10, 25, 14, 0, tzinfo=CN)
+        s3 = MerchantSnapshot(items=[], status="open", round_index=3, fetched_at=moment)
+        s4 = MerchantSnapshot(items=[], status="open", round_index=4, fetched_at=moment)
+        check("换轮后标记不继承",
+              purchases.round_key(s3, moment) != purchases.round_key(s4, moment))
+
+
+def test_catalog_store():
+    """物品清单：本机观察、手动增删、图标优先小图、Wiki 页面解析。"""
+    import tempfile
+    from pathlib import Path
+
+    import catalog
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "items.json"
+
+        check("图标优先缩略图",
+              catalog.prefer_small_icon(
+                  ["https://a.example/big.png", "https://a.example/100px-big.png"]
+              ).endswith("100px-big.png"))
+        check("没有缩略图时用第一个",
+              catalog.prefer_small_icon(["https://a.example/a.png",
+                                         "https://a.example/b.png"])
+              == "https://a.example/a.png")
+        check("空候选返回空串", catalog.prefer_small_icon([]) == "")
+
+        shelf = MerchantSnapshot(
+            items=[MerchantItem("测试果球", 8000, 1, icon_url="https://x/100px-a.png"),
+                   MerchantItem("测试网兜", 3000, 100, icon_url="https://x/big.png")],
+            status="open", round_index=2,
+        )
+        added = catalog.observe(shelf, path)
+        names = {i.name for i in catalog.load(path)}
+        check("本机商品自动入清单", added == 2 and {"测试果球", "测试网兜"} <= names,
+              f"added={added}")
+        icon = next(i for i in catalog.load(path) if i.name == "测试果球").icon
+        check("入清单时用缩略图", icon.endswith("100px-a.png"), icon)
+        check("内置清单含活动道具",
+              "可可果球" in {i.name for i in catalog.load(path)})
+
+        check("手动添加成功", catalog.add_manual("新活动球", path))
+        check("重复添加被拒绝", not catalog.add_manual("新活动球", path))
+        check("手动条目可查到", "新活动球" in {i.name for i in catalog.load(path)})
+        catalog.remove("新活动球", path)
+        check("移除后不再出现", "新活动球" not in {i.name for i in catalog.load(path)})
+
+        html = (
+            '<tr class="divsort shopdex-shop-row" id="shop-2002">'
+            '<td colspan="4"><span class="shopdex-shop-name">远行商人</span>'
+            '<span class="shopdex-shop-count">2 件</span></td></tr>'
+            '<tr class="divsort"><td>x</td><td>可可果</td><td>洛克贝</td></tr>'
+            '<tr class="divsort"><td>x</td><td>可可果球</td><td>洛克贝</td></tr>'
+            '<tr class="divsort shopdex-shop-row" id="shop-2003">'
+            '<td colspan="4"><span class="shopdex-shop-name">果子商店</span>'
+            '<span class="shopdex-shop-count">1 件</span></td></tr>'
+            '<tr class="divsort"><td>x</td><td>无花果</td><td>洛克贝</td></tr>'
+        )
+        check("只取远行商人名下的商品",
+              catalog.parse_shop_items(html) == ["可可果", "可可果球"],
+              str(catalog.parse_shop_items(html)))
+        check("空页面不抛异常", catalog.parse_shop_items("") == [])
+        check("能从条目页取图标",
+              catalog.parse_page_icon('<img src="https://patchwiki.biligame.com/x.png">')
+              == "https://patchwiki.biligame.com/x.png")
+
+
+def test_notify_item_selection():
+    """通知：品质筛选保留，关注物品无条件命中，两者取并集。"""
+    from notifier import Notifier, select_targets
+    from rarity import RARITY_TABLE
+
+    plain = MerchantItem("普通材料", 100, 5)
+    epic = MerchantItem("史诗宝珠", 500000, 1, rarity=RARITY_TABLE[4])
+    watched = MerchantItem("可可果球", 8000, 1)
+    snap = MerchantSnapshot(items=[plain, epic, watched])
+
+    names = lambda items: [i.name for i in items]
+    check("无关注物品时按品质筛选",
+          names(select_targets(snap, 4, [])) == ["史诗宝珠"],
+          str(names(select_targets(snap, 4, []))))
+    check("关注物品无视品质",
+          names(select_targets(snap, 4, ["可可果球"])) == ["史诗宝珠", "可可果球"],
+          str(names(select_targets(snap, 4, ["可可果球"]))))
+    check("两条规则取并集不重复",
+          names(select_targets(snap, 1, ["史诗宝珠"]))
+          == ["普通材料", "史诗宝珠", "可可果球"],
+          str(names(select_targets(snap, 1, ["史诗宝珠"]))))
+
+    title, _body = Notifier._compose([watched], ["可可果球"])
+    check("关注物品的标题不说错品质", title == "关注物品：可可果球", title)
+    rare_title, _body = Notifier._compose([epic], ["可可果球"])
+    check("未关注的仍按品质命名", rare_title == "史诗物品：史诗宝珠", rare_title)
+
+
+def test_midnight_shelf():
+    """24 点后不得再展示昨日货架（含上游仍报 open 的情况）。"""
+    from datetime import timedelta, timezone
+
+    from providers import snapshot_from_items, snapshot_from_payload
+
+    CN = timezone(timedelta(hours=8))
+    item = MerchantItem("国王球", 160000, 1, rounds=(1, 2, 3, 4))
+
+    before = snapshot_from_items([item], "t", "测试",
+                                moment=datetime(2026, 10, 25, 23, 59, tzinfo=CN))
+    check("打烊前正常展示", before.status == "open" and len(before.items) == 1,
+          f"{before.status}/{len(before.items)}")
+
+    after = snapshot_from_items([item], "t", "测试",
+                               moment=datetime(2026, 10, 26, 0, 5, tzinfo=CN))
+    check("00:05 清空昨日货架", after.items == [] and after.status == "closed",
+          f"{after.status}/{len(after.items)}")
+    check("00:05 不再算作某一轮", after.round_index == 0, str(after.round_index))
+
+    payload = {"status": "open", "round": 4,
+               "items": [{"name": "国王球", "price": 160000}]}
+    cached = snapshot_from_payload(payload, "t", "测试",
+                                   moment=datetime(2026, 10, 26, 0, 30, tzinfo=CN))
+    check("上游仍报 open 也按打烊处理",
+          cached.items == [] and cached.status == "closed",
+          f"{cached.status}/{len(cached.items)}")
+
+
+def test_purchase_and_history_widgets():
+    """界面：卡片勾选回调、已购样式、历史面板默认折叠。"""
+    import tempfile
+    from pathlib import Path
+
+    import history as history_mod
+    from cache import IconCache, ImageLoader
+    from ui.history_panel import HistoryPanel
+    from ui.widgets import ItemCard
+
+    root = tk.Tk()
+    root.withdraw()
+    cache = IconCache(Path(tempfile.mkdtemp()) / "icons", False)
+    loader = ImageLoader(root, cache)
+    try:
+        hits = []
+        card = ItemCard(root, MerchantItem("国王球", 160000, 1), loader,
+                        on_toggle=hits.append)
+        card._toggle_purchased()
+        check("卡片点击会触发勾选", bool(hits) and hits[0].name == "国王球")
+
+        bought = ItemCard(root, MerchantItem("网兜球", 3000, 5), loader,
+                          purchased=True, on_toggle=hits.append)
+        check("已购卡片显示勾选", "已购" in bought.toggle_btn.cget("text"),
+              bought.toggle_btn.cget("text"))
+
+        panel = HistoryPanel(root)
+        panel.set_rounds([
+            history_mod.HistoryRound("2026-10-25", 4, (MerchantItem("A", 1, 1),)),
+            history_mod.HistoryRound("2026-10-25", 3, (MerchantItem("B", 1, 1),)),
+        ])
+        check("历史面板默认折叠", panel._expanded is False)
+        panel.toggle()
+        check("展开后渲染出内容",
+              panel._expanded and len(panel._body.winfo_children()) >= 2,
+              str(len(panel._body.winfo_children())))
+
+        # 有加载器时，展开的历史必须仍是"商品卡片"，不能退化成一段纯文本
+        rich = HistoryPanel(root, loader=loader)
+        rich.set_rounds([history_mod.HistoryRound(
+            "2026-10-25", 4,
+            (MerchantItem("国王球", 160000, 1), MerchantItem("网兜球", 3000, 5)),
+        )])
+        rich.toggle()
+        root.update()
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        check("展开后复用商品卡片",
+              any(isinstance(w, ItemCard) for w in descendants(rich._body)))
+        check("展开按钮会变成收起", rich._toggle_btn._text == "收起历史",
+              rich._toggle_btn._text)
+    finally:
+        loader.shutdown()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
+def test_purchase_area_flow():
+    """端到端：勾选后商品离开在售区、进入「已购买」区，并落盘。"""
+    import ui.app_window as aw
+    import purchases
+
+    items = [MerchantItem("国王球", 160000, 1, rounds=(2,)),
+             MerchantItem("网兜球", 3000, 100, rounds=(1, 2, 3, 4))]
+    snap = MerchantSnapshot(items=items, status="open", round_index=2,
+                            expected_round=2, source_label="测试渠道",
+                            fetched_at=datetime.now())
+
+    original_fetch = aw.fetch_snapshot
+    aw.fetch_snapshot = lambda _config: (snap, [])
+    root = tk.Tk()
+    root.withdraw()
+    config = Config()
+    config.notify_enabled = False
+    config.verify_egress = False
+    app = None
+    try:
+        app = aw.MerchantApp(root, config)
+        app._watcher.forget()
+        app._shelf_state_key = None
+
+        def pump_until(condition, timeout=12):
+            end = time.time() + timeout
+            while time.time() < end:
+                root.update()
+                time.sleep(0.01)
+                if condition():
+                    return True
+            return False
+
+        ok = pump_until(lambda: app.snapshot is not None and len(app._cards) == 2)
+        check("初始两件都在在售区", ok and not app._bought_cards,
+              f"{len(app._cards)}/{len(app._bought_cards)}")
+
+        key = app._round_key(app.snapshot)
+        check("已购标记按轮次落盘", not purchases.is_bought(key, "国王球"))
+
+        app._toggle_purchased(items[0])
+        root.update()
+        check("勾选后进入已购买区",
+              len(app._cards) == 1 and len(app._bought_cards) == 1,
+              f"{len(app._cards)}/{len(app._bought_cards)}")
+        check("已购买区是国王球",
+              app._bought_cards[0].item.name == "国王球",
+              app._bought_cards[0].item.name)
+        check("勾选状态已写入磁盘", purchases.is_bought(key, "国王球"))
+
+        app._toggle_purchased(items[0])
+        root.update()
+        check("取消后回到在售区",
+              len(app._cards) == 2 and not app._bought_cards,
+              f"{len(app._cards)}/{len(app._bought_cards)}")
+        check("取消后不再记录", not purchases.is_bought(key, "国王球"))
+    finally:
+        aw.fetch_snapshot = original_fetch
+        if app is not None:
+            try:
+                purchases.clear_round(app._round_key(snap))
+            except Exception:      # noqa: BLE001
+                pass
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
 def test_netdirect_proxy_strip():
     """直连层第一道：代理环境变量被剥离，urllib 不再报告系统代理。"""
     import os
@@ -1759,6 +2101,9 @@ def _run_all():
                test_shelf_freshness_rules, test_all_day_recheck_flow,
                test_provider_onebiji, test_price_units,
                test_floating_refresh_button, test_floating_refresh_while_hidden,
+               test_history_store, test_purchase_marks, test_catalog_store,
+               test_notify_item_selection, test_midnight_shelf,
+               test_purchase_and_history_widgets, test_purchase_area_flow,
                test_give_up_policy, test_publish_script,
                test_settings_recheck_fields,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
