@@ -18,3 +18,7 @@ state.json
 _probe*.py
 _harness*.py
 _shot*.png
+
+# 本地开发文档：维护者私有（开发交接、UI 重写交接），不随仓库分发
+# tools/publish.py 的 EXCLUDE_PREFIXES 有同样规则，双保险
+docs/local/

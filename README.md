@@ -14,10 +14,19 @@
 
 ---
 
-> 想接手开发或让 AI 继续改这个项目？先读 **[docs/development.md](docs/development.md)**：
-> 文件职责、数据流、轮次模型、踩过的坑、改动指引都在那一份里。
+> 开发交接文档（文件职责、数据流、轮次模型、踩过的坑、改动指引）保存在**维护者本地**
+> `docs/local/`，不随仓库分发——`.gitignore` 与同步脚本都有排除规则。
 
 ## 功能
+
+### 外观主题
+- **四种主题模式**：深色（默认）/ 浅色 / 纯黑（OLED，省电且与息屏融合）/ 跟随系统
+  （通过注册表变更通知**推送式**感知 Windows 明暗切换，无轮询、即时生效）
+- **自定义强调色**：内置 6 色预设，也可在设置 →「外观」里填任意 `#rrggbb`
+- 滚轮平滑滚动（缓动动画）；查询结果卡片瀑布式入场，图标预加载同步就位，无逐条闪烁
+- 按钮与卡片悬停带渐变过渡反馈
+- 设置、日志、选择器等弹窗均无白屏闪烁
+- 后台常驻时自动修剪工作集，内存占用低（私有提交 < 30 MB）
 
 ### 定时查询
 - 默认 **08:05 / 12:05 / 16:05 / 20:05**（商人 08:00 / 12:00 / 16:00 / 20:00 换货，留 5 分钟给接口刷新）
@@ -303,28 +312,46 @@ roco-merchant/
 ├── main.py                     # 入口：版本检查、DPI、单实例、协议参数、日志初始化
 ├── app.spec                    # PyInstaller 配置（单文件 / 无控制台 / 图标）
 ├── requirements.txt            # 无必装依赖；Pillow 为可选增强
-├── config.py                   # 配置读写、渠道表、缓存/日志目录解析、资源路径
-├── providers.py                # 数据渠道与自动降级、字段自适应映射
-├── models.py                   # MerchantItem / MerchantSnapshot
-├── freshness.py                # 货架新鲜度判定：轮次落后 / 只剩全天商品 / 本轮商品消失
-├── history.py                  # 历史货架：按日期+轮次落盘，倒序读取，保留 7 天
-├── purchases.py                # 已购买标记：按轮次记录，换货自动失效
-├── catalog.py                  # 关注物品清单：Wiki 抓取 + 本机观察 + 手动添加
-├── numerals.py                 # 阿拉伯数字 → 中文读法
-├── rarity.py                   # 珍惜度判定规则
-├── cache.py                    # 图标磁盘缓存、异步加载、目录迁移
-├── scheduler.py                # 定时调度与倒计时
-├── monitors.py                 # 多显示器边界（EnumDisplayMonitors）
-├── tray.py                     # 系统托盘（Shell_NotifyIcon，独立线程消息循环）
-├── autostart.py                # 开机自启（HKCU Run 键）
-├── single_instance.py          # 单实例互斥与唤醒
-├── notifier.py                 # 通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
-├── notifier_native.py          # WinRT Toast、AppUserModelID、rocomesh:// 协议注册
-├── applog.py                   # 日志与异常钩子
-├── selftest.py                 # 自测（339 项）
+├── selftest.py                 # 自测（340 项）
+│
+├── roco/                       # 全部运行时模块（依赖方向：ui → services → net → core）
+│   ├── config.py               #   配置读写、渠道表、缓存/日志目录解析、资源路径
+│   ├── applog.py               #   日志与异常钩子
+│   ├── core/                   #   纯领域逻辑（零 Tk / 零网络，最易测）
+│   │   ├── models.py           #     MerchantItem / MerchantSnapshot
+│   │   ├── rounds.py           #     轮次模型：时区、营业时间、轮次过滤
+│   │   ├── freshness.py        #     货架新鲜度判定：轮次落后 / 只剩全天商品 / 本轮商品消失
+│   │   ├── history.py          #     历史货架：按日期+轮次落盘，倒序读取，保留 7 天
+│   │   ├── purchases.py        #     已购买标记：按轮次记录，换货自动失效
+│   │   ├── numerals.py         #     阿拉伯数字 → 中文读法
+│   │   └── rarity.py           #     珍惜度判定规则
+│   ├── net/                    #   数据获取
+│   │   ├── providers.py        #     数据渠道与自动降级
+│   │   ├── parsing.py          #     页面/JSON → 快照的纯解析
+│   │   ├── netdirect.py        #     直连网络层：剥代理 / DoH / 出口诊断
+│   │   └── catalog.py          #     关注物品清单：Wiki 抓取 + 本机观察 + 手动添加
+│   ├── services/               #   应用级服务
+│   │   ├── cache.py            #     图标磁盘缓存、异步加载、目录迁移
+│   │   └── scheduler.py        #     定时调度与倒计时
+│   ├── platform/               #   Windows 平台能力
+│   │   ├── tray.py             #     系统托盘（Shell_NotifyIcon，独立线程消息循环）
+│   │   ├── notifier.py         #     通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
+│   │   ├── notifier_native.py  #     WinRT Toast、AppUserModelID、rocomesh:// 协议注册
+│   │   ├── autostart.py        #     开机自启（HKCU Run 键）
+│   │   ├── single_instance.py  #     单实例互斥与唤醒
+│   │   └── monitors.py         #     多显示器边界（EnumDisplayMonitors）
+│   └── ui/                     #   界面层（唯一 import Tk 的地方）
+│       ├── app_window.py       #     主窗口视图：布局 / 渲染 / 托盘 / 悬浮窗
+│       ├── app_controller.py   #     视图控制器：取数编排 / 换货校验 / 落盘 / 通知决策
+│       ├── settings_dialog.py  #     设置面板、network_dialog、history_panel、floating_window 等
+│       ├── widgets.py          #     自绘控件（PillButton / ItemCard / ScrollFrame…）
+│       └── theme.py            #     颜色与字体
 │
 ├── scripts/                    # 所有可双击运行的脚本
-│   ├── run.bat                 #   源码启动
+│   ├── dev.bat                 #   源码启动（自动挑带 tkinter 的解释器）
+│   ├── test.bat                #   只跑自测
+│   ├── check.bat               #   提交前门禁：语法检查 + 自测
+│   ├── logs.bat                #   打开日志目录
 │   ├── build.bat               #   一键打包 exe
 │   └── sync.bat                #   一键同步到 GitHub（自测 → 提交 → 推送）
 │
@@ -338,7 +365,6 @@ roco-merchant/
 │   └── make_icon.py            #   纯标准库生成 assets/app.ico
 │
 ├── docs/
-│   ├── development.md          # 开发交接：数据流、轮次模型、可配置项、同步流程
 │   ├── cn-mirror.md            # 自建大陆反代（Nginx / 云函数两套方案）
 │   ├── release-notes.md        # 当前版本的发布说明（发布时作为 Release 正文）
 │   └── ci/release.yml          # CI 模板：复制到 .github/workflows/ 后生效
@@ -369,7 +395,7 @@ roco-merchant/
 python selftest.py
 ```
 
-覆盖 339 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
+覆盖 340 项断言，包括：数字转换、珍惜度、轮次计算、定时触发与去重、渠道降级、
 通知 XML 与去重、图标缓存与迁移、缓存/日志目录回退、自启命令拼装、单实例互斥与唤醒、
 悬浮窗渲染与收起、多屏边界（合成三屏，含左侧负坐标副屏）、真实双屏下的副屏落位与持久化、
 托盘创建与清理、关闭到托盘后仍能恢复、界面异常落盘、悬浮窗图标开关（开/关后行数与文字不变）、
@@ -395,7 +421,7 @@ python tools\publish.py --dry-run    :: 只看会提交哪些文件
 脚本默认跳过 `dist/`、`build/`、`__pycache__/`、`logs/`、`.github/` 等不该入库的东西；
 CI 工作流以模板形式放在 `docs/ci/release.yml`，需要时复制回 `.github/workflows/`
 （推送 workflow 需要带 `workflow` 权限的 token）。规则、失败处理与"同步 ≠ 发版"的区别见
-**[docs/development.md](docs/development.md) 第 8 章**。
+维护者本地的 `docs/local/development.md` 第 8 章（不随仓库分发）。
 
 ---
 

@@ -38,10 +38,11 @@ INCLUDE_SUFFIXES = {
     ".py", ".md", ".txt", ".bat", ".spec", ".json", ".yml", ".yaml",
     ".ico", ".png", ".cfg", ".toml", ".gitignore", ".gitattributes",
 }
-# 永远不推的目录前缀（构建产物 / 缓存 / 需要额外权限的 CI）
+# 永远不推的目录前缀（构建产物 / 缓存 / 需要额外权限的 CI / 本地开发文档）
+# docs/local/ 是维护者私有的开发交接文档，已同时列入 .gitignore，双保险
 EXCLUDE_PREFIXES = (
     "dist/", "build/", "__pycache__/", ".workbuddy/", ".github/",
-    "logs/", ".venv/", "venv/", "data/cache/",
+    "logs/", ".venv/", "venv/", "data/cache/", "docs/local/",
 )
 EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".exe", ".zip", ".log", ".tmp", ".bak"}
 # 单个文件的上限：超过基本就是误入的产物，别推

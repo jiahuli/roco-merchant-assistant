@@ -11,14 +11,14 @@ import tkinter as tk
 
 from contextlib import contextmanager
 
-import autostart
-from config import Config, config_path, sanitize_times, state_path
-from models import MerchantItem, MerchantSnapshot
-from numerals import to_chinese_number
-from providers import (ProviderError, build_provider, fetch_snapshot, next_refresh_at,
-                       round_index_at, is_open_at)
-from rarity import infer_rarity
-from scheduler import Scheduler, format_countdown
+from roco.platform import autostart
+from roco.config import Config, config_path, sanitize_times, state_path
+from roco.core.models import MerchantItem, MerchantSnapshot
+from roco.core.numerals import to_chinese_number
+from roco.net.providers import ProviderError, build_provider, fetch_snapshot
+from roco.core.rounds import next_refresh_at, round_index_at, is_open_at
+from roco.core.rarity import infer_rarity
+from roco.services.scheduler import Scheduler, format_countdown
 
 PASS, FAIL = "PASS", "FAIL"
 
@@ -95,7 +95,7 @@ def test_time_parsing():
 
 def test_rounds():
     from datetime import datetime
-    from providers import CN_TZ
+    from roco.core.rounds import CN_TZ
     moment = datetime(2026, 10, 20, 13, 30, tzinfo=CN_TZ)
     check("轮次计算", round_index_at(moment) == 2, str(round_index_at(moment)))
     check("下次刷新", next_refresh_at(moment).hour == 16, str(next_refresh_at(moment)))
@@ -151,7 +151,7 @@ def test_provider_bad_url():
 
 
 def test_notification_dedupe():
-    from ui.app_window import MerchantApp
+    from roco.ui.app_window import MerchantApp
     root = tk.Tk()
     root.withdraw()
     config = Config.load()
@@ -191,7 +191,7 @@ def test_notification_dedupe():
 
 
 def test_render_states():
-    from ui.app_window import MerchantApp
+    from roco.ui.app_window import MerchantApp
     root = tk.Tk()
     root.withdraw()
     config = Config.load()
@@ -212,7 +212,7 @@ def test_render_states():
     except Exception as exc:
         check("空货架渲染", False, f"{type(exc).__name__}: {exc}")
 
-    from cache import IconCache
+    from roco.services.cache import IconCache
     app.scheduler.stop()
     app.loader.shutdown()
     app.pool.shutdown(wait=False)
@@ -220,8 +220,8 @@ def test_render_states():
 
 
 def test_icon_cache():
-    from cache import IconCache
-    from config import cache_dir
+    from roco.services.cache import IconCache
+    from roco.config import cache_dir
     cache = IconCache(cache_dir(), enabled=True)
     url = "https://patchwiki.biligame.com/images/rocom/thumb/b/bc/khe20j8lwkt1bg9g4b0gbnsff48g93c.png/100px-100628.png"
     first = cache.download(url)
@@ -239,8 +239,8 @@ def test_cache_path():
     import tempfile
     from pathlib import Path
 
-    from cache import IconCache, migrate_cache
-    from config import Config, default_cache_dir, resolve_icon_cache_dir
+    from roco.services.cache import IconCache, migrate_cache
+    from roco.config import Config, default_cache_dir, resolve_icon_cache_dir
 
     config = Config()
     path, warning = resolve_icon_cache_dir(config)
@@ -275,7 +275,7 @@ def test_cache_path():
 
 def test_autostart():
     """开机自启：命令拼装 + 读取状态（不写注册表，避免污染系统）。"""
-    import autostart
+    from roco.platform import autostart
 
     command = autostart.launch_command()
     check("自启命令可拼装", bool(command) and "--autostart" in command, command[:60])
@@ -289,7 +289,7 @@ def test_native_notify():
     """原生通知：XML 合法 + 支持判定（不发真实通知）。"""
     from xml.dom.minidom import parseString
 
-    import notifier_native
+    from roco.platform import notifier_native
 
     xml = notifier_native.build_xml("标题<&>", "正文 320 万")
     try:
@@ -306,7 +306,7 @@ def test_single_instance():
     import time
     import uuid
 
-    import single_instance as si
+    from roco.platform import single_instance as si
 
     # 隔离：真实互斥名可能正被用户运行中的程序占用（那说明单实例生效了，
     # 不该让自测因此变红）。这里换成一次性名字，只验证机制本身。
@@ -329,7 +329,7 @@ def test_single_instance():
 
 
 def test_floating_window():
-    from ui.floating_window import HEADER_H, FloatingWindow
+    from roco.ui.floating_window import HEADER_H, FloatingWindow
 
     root = tk.Tk()
     root.withdraw()
@@ -438,7 +438,7 @@ def test_config_roundtrip():
 
 def test_notify_fallback_chain():
     """原生成功时不弹浮窗；原生失败才兜底。"""
-    from notifier import Notifier
+    from roco.platform.notifier import Notifier
 
     root = tk.Tk()
     root.withdraw()
@@ -473,7 +473,7 @@ def test_notify_fallback_chain():
 
 def test_monitor_math():
     """多屏边界：用合成显示器验证，不依赖真实硬件。"""
-    from monitors import (Monitor, best_monitor, clamp_drag, default_position,
+    from roco.platform.monitors import (Monitor, best_monitor, clamp_drag, default_position,
                           is_visible_on, virtual_bounds)
 
     left = Monitor(-1920, 0, 1920, 1080, -1920, 0, 1920, 1040)          # 副屏在左
@@ -511,8 +511,8 @@ def test_monitor_math():
 
 def test_floating_multimonitor():
     """真实多屏：副屏落位 + 拖动 + 位置持久化。"""
-    from monitors import enum_monitors
-    from ui.floating_window import FloatingWindow
+    from roco.platform.monitors import enum_monitors
+    from roco.ui.floating_window import FloatingWindow
 
     screens = enum_monitors()
     root = tk.Tk()
@@ -565,8 +565,8 @@ def test_logging():
     import tempfile
     from pathlib import Path
 
-    import applog
-    from config import Config
+    from roco import applog
+    from roco.config import Config
 
     config = Config()
     path = applog.setup(config)
@@ -594,7 +594,7 @@ def test_logging():
     applog.setup(Config())
 
     # 查看器能正常渲染（不显示图片，纯文本）
-    from ui.log_viewer import LogViewer
+    from roco.ui.log_viewer import LogViewer
 
     root = tk.Tk()
     root.withdraw()
@@ -608,7 +608,7 @@ def test_logging():
 
 def test_tk_error_hook():
     """界面回调异常要落到日志里，而不是消失。"""
-    import applog
+    from roco import applog
 
     applog.setup(Config())
     root = tk.Tk()
@@ -631,8 +631,9 @@ def test_tk_error_hook():
 
 def test_rounds_parsing():
     """rounds 字段：解析、全天判定、按轮次过滤。"""
-    from models import MerchantItem, TOTAL_ROUNDS
-    from providers import _to_rounds, filter_by_round
+    from roco.core.models import MerchantItem, TOTAL_ROUNDS
+    from roco.net.parsing import _to_rounds
+    from roco.core.rounds import filter_by_round
 
     check("列表解析", _to_rounds([1, 2, 3, 4]) == (1, 2, 3, 4))
     check("去重排序", _to_rounds([3, 1, 1]) == (1, 3))
@@ -662,7 +663,7 @@ def test_rounds_parsing():
 
 def test_round_lag_detection():
     """换货滞后判定：接口轮次落后本地时即为滞后。"""
-    from models import MerchantItem, MerchantSnapshot
+    from roco.core.models import MerchantItem, MerchantSnapshot
 
     item = MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
     lagging = MerchantSnapshot(items=[item], status="open", round_index=1, expected_round=2)
@@ -675,7 +676,7 @@ def test_round_lag_detection():
     check("全天件数统计", lagging.all_day_count == 1, str(lagging.all_day_count))
 
     # 真实结构：把接口返回体喂给解析器，验证轮次与过滤同时生效
-    from providers import snapshot_from_payload
+    from roco.net.parsing import snapshot_from_payload
 
     payload = {
         "status": "open",
@@ -698,8 +699,8 @@ def test_round_retry_flow():
     """端到端：接口一直返回旧轮次时会自动重试；换到新轮次后停止。"""
     import time
 
-    import ui.app_window as aw
-    from models import MerchantItem, MerchantSnapshot
+    import roco.ui.app_window as aw
+    from roco.core.models import MerchantItem, MerchantSnapshot
 
     def make_snapshot(round_no: int):
         items = [MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))]
@@ -785,7 +786,7 @@ def test_round_retry_flow():
 
 def test_shelf_freshness_rules():
     """1.4.2 新判据：只剩全天商品 + 内容未变 → 判定为"其实没换货"。"""
-    from freshness import (ACTION_GIVE_UP, ACTION_RETRY, CODE_ALL_DAY_ONLY,
+    from roco.core.freshness import (ACTION_GIVE_UP, ACTION_RETRY, CODE_ALL_DAY_ONLY,
                            CODE_ROUND_LAG, CODE_SHELF_SHRANK, ShelfWatcher)
 
     def snap(items, rnd=2, exp=2, status="open", src="onebiji"):
@@ -859,7 +860,7 @@ def test_shelf_freshness_rules():
     check("无 rounds 字段不误判全天货架",
           not unknown.observe(snap([MerchantItem("神秘商品", 100, 1)])).should_retry)
 
-    from freshness import format_delay
+    from roco.core.freshness import format_delay
     check("延迟文案", format_delay(300) == "5 分钟" and format_delay(45) == "45 秒"
           and format_delay(90) == "1 分 30 秒",
           f"{format_delay(300)}/{format_delay(45)}/{format_delay(90)}")
@@ -867,7 +868,7 @@ def test_shelf_freshness_rules():
     # 复现被卡住的现场：接口 round 已刷成第 2 轮，items 还是第 1 轮的货架。
     # filter_by_round() 把 rounds=[1] 的旧商品剔掉，只剩两件全天商品，
     # 而 is_round_lagging 为 False —— 1.4.1 会认为一切正常，从此不再重试。
-    from providers import snapshot_from_payload
+    from roco.net.parsing import snapshot_from_payload
 
     stale_payload = {
         "status": "open",
@@ -907,8 +908,8 @@ def test_shelf_freshness_rules():
 
 def test_all_day_recheck_flow():
     """端到端：卡在两件全天商品上时，程序自己会按配置延后重取，且能收敛。"""
-    import ui.app_window as aw
-    from freshness import ShelfObservation, ShelfWatcher
+    import roco.ui.app_window as aw
+    from roco.core.freshness import ShelfObservation, ShelfWatcher
 
     def make_snapshot(with_round_item: bool):
         items = [MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4)),
@@ -1027,8 +1028,8 @@ def test_settings_recheck_fields():
     import tempfile
     from pathlib import Path
 
-    from cache import IconCache
-    from ui.settings_dialog import SettingsDialog
+    from roco.services.cache import IconCache
+    from roco.ui.settings_dialog import SettingsDialog
 
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "config.json"
@@ -1090,7 +1091,7 @@ def test_settings_recheck_fields():
 
 def test_give_up_policy():
     """收尾方式可选：stop（默认，原行为）与 slow（慢速续试），互不干扰。"""
-    from freshness import (ACTION_GIVE_UP, ACTION_RETRY, POLICY_SLOW, POLICY_STOP,
+    from roco.core.freshness import (ACTION_GIVE_UP, ACTION_RETRY, POLICY_SLOW, POLICY_STOP,
                            ShelfWatcher)
 
     def snap(items, rnd=2, exp=2):
@@ -1179,7 +1180,8 @@ def test_publish_script():
     spec.loader.exec_module(module)
 
     check("源码可同步", module.is_publishable("freshness.py"))
-    check("文档可同步", module.is_publishable("docs/development.md"))
+    check("公共文档可同步", module.is_publishable("docs/cn-mirror.md"))
+    check("本地开发文档不同步", not module.is_publishable("docs/local/development.md"))
     check("脚本可同步", module.is_publishable("scripts/sync.bat"))
     check("产物不同步", not module.is_publishable("dist/远行商人助手.exe", 1024))
     check("构建目录不同步", not module.is_publishable("build/x.py"))
@@ -1200,9 +1202,10 @@ def test_publish_script():
 
 def test_provider_onebiji():
     """中文查询器：页面解析、同名多轮合并、渠道注册与老配置迁移。"""
-    from config import DEFAULT_PROVIDERS
-    from providers import (_REGISTRY, filter_by_round, parse_bwiki_shops,
-                           parse_onebiji_html)
+    from roco.config import DEFAULT_PROVIDERS
+    from roco.net.providers import _REGISTRY
+    from roco.core.rounds import filter_by_round
+    from roco.net.parsing import parse_bwiki_shops, parse_onebiji_html
 
     page = '''
     <ul class="shop-list">
@@ -1274,7 +1277,7 @@ def test_provider_onebiji():
           Config().providers["bwiki"]["base_url"])
 
     # 自建反代既能转发 JSON，也能转发页面（HTML → items）
-    from providers import CnMirrorProvider
+    from roco.net.providers import CnMirrorProvider
 
     mirror = CnMirrorProvider({"base_url": "https://mirror.example/merchant"})
     mirror._request_text = lambda url, headers=None, use_doh=True: page
@@ -1304,8 +1307,8 @@ def test_provider_onebiji():
 
 def test_price_units():
     """价格简写单位（16w / 16万）不能被截断成 16 —— 2026-10-25 的回归用例。"""
-    from numerals import to_chinese_number
-    from providers import _to_int, parse_onebiji_html
+    from roco.core.numerals import to_chinese_number
+    from roco.net.parsing import _to_int, parse_onebiji_html
 
     cases = {
         "16w": 160000, "16W": 160000, "16万": 160000, "1.6w": 16000,
@@ -1337,7 +1340,7 @@ def test_price_units():
 
 def test_floating_refresh_button():
     """悬浮窗的「⟳」：不打开主窗口也能取数，状态能复位。"""
-    from ui.floating_window import FloatingWindow
+    from roco.ui.floating_window import FloatingWindow
 
     root = tk.Tk()
     root.withdraw()
@@ -1374,7 +1377,7 @@ def test_floating_refresh_button():
 
 def test_floating_refresh_while_hidden():
     """端到端：主窗口藏在托盘里，点悬浮窗按钮也能拿到并展示最新物品。"""
-    import ui.app_window as aw
+    import roco.ui.app_window as aw
 
     state = {"calls": 0}
 
@@ -1449,7 +1452,7 @@ def test_history_store():
     from datetime import timedelta, timezone
     from pathlib import Path
 
-    import history
+    from roco.core import history
 
     CN = timezone(timedelta(hours=8))
     all_day = MerchantItem("条件球", 3000, 100, rounds=(1, 2, 3, 4))
@@ -1508,7 +1511,7 @@ def test_purchase_marks():
     from datetime import timedelta, timezone
     from pathlib import Path
 
-    import purchases
+    from roco.core import purchases
 
     CN = timezone(timedelta(hours=8))
     with tempfile.TemporaryDirectory() as folder:
@@ -1537,7 +1540,7 @@ def test_catalog_store():
     import tempfile
     from pathlib import Path
 
-    import catalog
+    from roco.net import catalog
 
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "items.json"
@@ -1594,8 +1597,8 @@ def test_catalog_store():
 
 def test_notify_item_selection():
     """通知：品质筛选保留，关注物品无条件命中，两者取并集。"""
-    from notifier import Notifier, select_targets
-    from rarity import RARITY_TABLE
+    from roco.platform.notifier import Notifier, select_targets
+    from roco.core.rarity import RARITY_TABLE
 
     plain = MerchantItem("普通材料", 100, 5)
     epic = MerchantItem("史诗宝珠", 500000, 1, rarity=RARITY_TABLE[4])
@@ -1624,7 +1627,7 @@ def test_midnight_shelf():
     """24 点后不得再展示昨日货架（含上游仍报 open 的情况）。"""
     from datetime import timedelta, timezone
 
-    from providers import snapshot_from_items, snapshot_from_payload
+    from roco.net.parsing import snapshot_from_items, snapshot_from_payload
 
     CN = timezone(timedelta(hours=8))
     item = MerchantItem("国王球", 160000, 1, rounds=(1, 2, 3, 4))
@@ -1654,10 +1657,10 @@ def test_purchase_and_history_widgets():
     import tempfile
     from pathlib import Path
 
-    import history as history_mod
-    from cache import IconCache, ImageLoader
-    from ui.history_panel import HistoryPanel
-    from ui.widgets import ItemCard
+    from roco.core import history as history_mod
+    from roco.services.cache import IconCache, ImageLoader
+    from roco.ui.history_panel import HistoryPanel
+    from roco.ui.widgets import ItemCard
 
     root = tk.Tk()
     root.withdraw()
@@ -1722,8 +1725,8 @@ def test_purchase_and_history_widgets():
 
 def test_purchase_area_flow():
     """端到端：勾选后商品离开在售区、进入「已购买」区，并落盘。"""
-    import ui.app_window as aw
-    import purchases
+    import roco.ui.app_window as aw
+    from roco.core import purchases
 
     items = [MerchantItem("国王球", 160000, 1, rounds=(2,)),
              MerchantItem("网兜球", 3000, 100, rounds=(1, 2, 3, 4))]
@@ -1796,8 +1799,8 @@ def test_history_settings():
     from datetime import datetime
     from pathlib import Path
 
-    import history
-    from config import Config, default_history_dir, resolve_history_dir
+    from roco.core import history
+    from roco.config import Config, default_history_dir, resolve_history_dir
 
     with tempfile.TemporaryDirectory() as folder:
         target = Path(folder) / "h"
@@ -1843,7 +1846,7 @@ def test_history_disabled_flow():
     import tempfile
     from pathlib import Path
 
-    import ui.app_window as aw
+    import roco.ui.app_window as aw
 
     snap = MerchantSnapshot(
         items=[MerchantItem("国王球", 160000, 1, rounds=(2,))],
@@ -1898,7 +1901,7 @@ def test_netdirect_proxy_strip():
     """直连层第一道：代理环境变量被剥离，urllib 不再报告系统代理。"""
     import os
 
-    import netdirect
+    from roco.net import netdirect
 
     saved = {k: os.environ.get(k) for k in netdirect.PROXY_ENV_KEYS}
     try:
@@ -1929,7 +1932,7 @@ def test_netdirect_proxy_strip():
 
 def test_netdirect_addr():
     """地址判定：fake-ip、中国大陆网段、URL 解析、IP 优选。"""
-    import netdirect
+    from roco.net import netdirect
 
     check("fake-ip 能识别", netdirect.is_fake_ip("198.18.1.112"))
     check("保留段能识别", netdirect.is_fake_ip("127.0.0.1") and netdirect.is_fake_ip("10.0.0.1"))
@@ -1961,7 +1964,7 @@ def test_netdirect_addr():
 
 def test_netdirect_doh():
     """直连层第二道：DoH 取得的是真实 IP，且能识别被劫持的系统 DNS。"""
-    import netdirect
+    from roco.net import netdirect
 
     netdirect.install()
     netdirect.clear_dns_cache()
@@ -1983,7 +1986,7 @@ def test_netdirect_doh():
 
 def test_clash_rules():
     """直连规则生成：域名与 DoH 引导 IP 都要 DIRECT，且顺序在代理规则之前。"""
-    import netdirect
+    from roco.net import netdirect
 
     hosts = ["onebiji.com"]
     rules = netdirect.clash_rules(hosts)
@@ -2002,8 +2005,8 @@ def test_clash_rules():
 
 def test_cn_mirror_provider():
     """大陆反代渠道：未配置时跳过，配好后能识别为大陆。"""
-    from config import Config
-    from providers import build_provider
+    from roco.config import Config
+    from roco.net.providers import build_provider
 
     config = Config()
     config.providers.setdefault("cn_mirror", {})["base_url"] = ""
@@ -2021,7 +2024,7 @@ def test_cn_mirror_provider():
 
 def test_route_on_snapshot():
     """快照要带上路由信息，界面才能显示出口。"""
-    from models import MerchantSnapshot
+    from roco.core.models import MerchantSnapshot
 
     snap = MerchantSnapshot(items=[])
     check("快照有 route 字段", isinstance(snap.route, dict), str(type(snap.route)))
@@ -2031,8 +2034,8 @@ def test_route_on_snapshot():
 
 def test_main_window_geometry():
     """主窗口位置恢复：副屏位置不能被误判为"越界"。"""
-    from monitors import enum_monitors
-    from ui.app_window import MerchantApp
+    from roco.platform.monitors import enum_monitors
+    from roco.ui.app_window import MerchantApp
 
     screens = enum_monitors()
     root = tk.Tk()
@@ -2075,7 +2078,7 @@ def test_floating_icon_switch():
         def shutdown(self):
             pass
 
-    from ui.floating_window import FloatingWindow
+    from roco.ui.floating_window import FloatingWindow
 
     root = tk.Tk()
     root.withdraw()
@@ -2140,7 +2143,7 @@ def test_floating_icon_switch():
 
 def test_tray_icon():
     """托盘图标：创建、菜单可生成、气泡可用、可清理。"""
-    import tray as tray_module
+    from roco.platform import tray as tray_module
 
     commands = []
     icon = tray_module.TrayIcon(
@@ -2160,7 +2163,7 @@ def test_tray_icon():
 
 def test_close_to_tray_switch():
     """关闭行为：配置可切换，且托盘不可用时必须能真正退出（不能卡死）。"""
-    from ui.app_window import MerchantApp
+    from roco.ui.app_window import MerchantApp
 
     root = tk.Tk()
     root.withdraw()

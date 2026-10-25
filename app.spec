@@ -11,11 +11,17 @@
 block_cipher = None
 
 hidden = [
-    "ui", "ui.theme", "ui.widgets", "ui.app_window",
-    "ui.settings_dialog", "ui.floating_window",
-    "providers", "rarity", "numerals", "cache", "scheduler",
-    "notifier", "notifier_native", "autostart", "single_instance", "models", "config",
-    "monitors", "tray", "netdirect",
+    "roco", "roco.ui", "roco.ui.theme", "roco.ui.widgets", "roco.ui.app_window",
+    "roco.ui.settings_dialog", "roco.ui.floating_window",
+    "roco.net.providers", "roco.net.netdirect", "roco.net.catalog",
+    "roco.core.rarity", "roco.core.numerals", "roco.core.models",
+    "roco.core.freshness", "roco.core.history", "roco.core.purchases",
+    "roco.services.cache", "roco.services.scheduler",
+    "roco.platform.notifier", "roco.platform.notifier_native",
+    "roco.platform.autostart", "roco.platform.single_instance",
+    "roco.platform.monitors", "roco.platform.tray", "roco.platform.theme_listener",
+    "roco.platform.memory", "roco.platform.win11_style",
+    "roco.config", "roco.applog",
 ]
 
 a = Analysis(

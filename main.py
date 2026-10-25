@@ -46,13 +46,13 @@ def main() -> int:
 
     import tkinter as tk
 
-    import applog
-    import autostart
-    import netdirect
-    import notifier_native
-    import single_instance
-    from config import Config
-    from ui.app_window import MerchantApp
+    from roco import applog
+    from roco.platform import autostart
+    from roco.net import netdirect
+    from roco.platform import notifier_native
+    from roco.platform import single_instance
+    from roco.config import Config
+    from roco.ui.app_window import MerchantApp
 
     wants_show = any("rocomesh:" in arg.lower() for arg in sys.argv[1:])
 
