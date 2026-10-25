@@ -1185,10 +1185,11 @@ def test_publish_script():
     check("超大文件不同步", not module.is_publishable("assets/big.png", 30 * 1024 * 1024))
     check("反斜杠路径也能识别", module.is_publishable("ui\\app_window.py"))
 
-    msg = module.build_commit_message(["ui/app_window.py", "README.md"], "1.4.3",
+    # 版本号用明显的假值，避免与实际发版号混在一起被误读
+    msg = module.build_commit_message(["ui/app_window.py", "README.md"], "9.9.9",
                                       datetime(2026, 10, 23, 21, 0))
     check("提交信息含类型与日期", "代码" in msg and "文档" in msg and "2026-10-23" in msg, msg)
-    check("提交信息带版本号", "v1.4.3" in msg, msg)
+    check("提交信息带版本号", "v9.9.9" in msg, msg)
     check("无版本号时不出现空括号",
           "（v" not in module.build_commit_message(["README.md"]))
 
@@ -1477,11 +1478,11 @@ def test_netdirect_addr():
 
     check("fake-ip 能识别", netdirect.is_fake_ip("198.18.1.112"))
     check("保留段能识别", netdirect.is_fake_ip("127.0.0.1") and netdirect.is_fake_ip("10.0.0.1"))
-    check("真实公网 IP 不算 fake", not netdirect.is_fake_ip("104.21.43.145"))
+    check("真实公网 IP 不算 fake", not netdirect.is_fake_ip("8.8.8.8"))
 
     check("大陆 IP 判定（电信 DNS）", netdirect.is_cn_ip("223.5.5.5"))
     check("大陆 IP 判定（腾讯 DoH）", netdirect.is_cn_ip("1.12.12.12"))
-    check("境外 IP 判定（Cloudflare）", not netdirect.is_cn_ip("104.21.43.145"))
+    check("境外 IP 判定", not netdirect.is_cn_ip("8.8.8.8"))
     check("CDN 不会误判", not netdirect.is_cn_ip("8.8.8.8"))
     check("非法输入不抛异常", not netdirect.is_cn_ip("不是 IP") and not netdirect.is_cn_ip(""))
 
@@ -1498,9 +1499,9 @@ def test_netdirect_addr():
         check("拒绝非 http 协议", True)
 
     check("优先选大陆 IP",
-          netdirect._pick_ip(["104.21.43.145", "223.5.5.5"]) == "223.5.5.5")
+          netdirect._pick_ip(["8.8.8.8", "223.5.5.5"]) == "223.5.5.5")
     check("显式指定 IP 优先",
-          netdirect._pick_ip(["104.21.43.145", "223.5.5.5"], "104.21.43.145") == "104.21.43.145")
+          netdirect._pick_ip(["8.8.8.8", "223.5.5.5"], "8.8.8.8") == "8.8.8.8")
 
 
 def test_netdirect_doh():
@@ -1529,9 +1530,9 @@ def test_clash_rules():
     """直连规则生成：域名与 DoH 引导 IP 都要 DIRECT，且顺序在代理规则之前。"""
     import netdirect
 
-    hosts = ["rocokingdomworld.org"]
+    hosts = ["onebiji.com"]
     rules = netdirect.clash_rules(hosts)
-    check("规则含域名直连", "DOMAIN-SUFFIX,rocokingdomworld.org,DIRECT" in rules, rules[:120])
+    check("规则含域名直连", "DOMAIN-SUFFIX,onebiji.com,DIRECT" in rules, rules[:120])
     check("规则含 DoH 引导直连", "IP-CIDR,223.5.5.5/32,DIRECT,no-resolve" in rules)
     check("规则首行是 rules:",
           rules.strip().splitlines()[0].strip() == "rules:",

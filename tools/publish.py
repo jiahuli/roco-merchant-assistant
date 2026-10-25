@@ -14,7 +14,7 @@
 ----
     python tools/publish.py                          # 自动生成提交信息
     python tools/publish.py -m "fix(x): 修好了"       # 指定提交信息
-    python tools/publish.py --tag v1.4.3             # 顺便打注释标签并推送
+    python tools/publish.py --tag vX.Y.Z             # 顺便打注释标签并推送
     python tools/publish.py --dry-run                # 只打印会提交哪些文件
     python tools/publish.py --skip-tests             # 明确跳过自测（不推荐）
     python tools/publish.py --push-only              # 只推送已有的本地提交
@@ -224,7 +224,7 @@ def remote_head(branch: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="把本次改动同步到 GitHub")
     parser.add_argument("-m", "--message", default="", help="提交信息（缺省自动生成）")
-    parser.add_argument("--tag", default="", help="顺便打注释标签并推送，如 v1.4.3")
+    parser.add_argument("--tag", default="", help="顺便打注释标签并推送，如 vX.Y.Z（必须等于 v{APP_VERSION}）")
     parser.add_argument("--dry-run", action="store_true", help="只打印计划，不提交")
     parser.add_argument("--skip-tests", action="store_true", help="跳过自测（不推荐）")
     parser.add_argument("--push-only", action="store_true", help="只推送已有提交")

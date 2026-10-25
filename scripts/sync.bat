@@ -9,7 +9,7 @@ echo ============================================
 echo.
 echo  可传参数，例如：
 echo    scripts\sync.bat -m "fix(x): 修好了"
-echo    scripts\sync.bat --tag v1.4.3
+echo    scripts\sync.bat --tag vX.Y.Z
 echo    scripts\sync.bat --dry-run        只看会提交哪些文件
 echo.
 

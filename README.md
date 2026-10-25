@@ -214,11 +214,13 @@ scripts/build.bat
 
 ### 改动位置与参数
 - `tools/release.py` —— 发布脚本。`STABLE_ASSET` 常量控制固定名，`archive_previous()` 控制归档；`--asset` 指定 exe 路径，`--draft` 先发草稿，`--archive-only` 只归档不发布
-- `.github/workflows/release.yml` —— CI。触发条件 `on.push.tags: v*`；`permissions.contents: write` 是上传资产的前提；`env.GH_TOKEN` 取 `secrets.GITHUB_TOKEN`；`actions/checkout` 需 `fetch-depth: 0`（脚本要查 tag）
+- `docs/ci/release.yml` —— CI 模板（复制到 `.github/workflows/` 后生效）。触发条件 `on.push.tags: v*`；`permissions.contents: write` 是上传资产的前提；`env.GH_TOKEN` 取 `secrets.GITHUB_TOKEN`；`actions/checkout` 需 `fetch-depth: 0`（脚本要查 tag）
 - `config.py` —— `APP_VERSION`，改这里即可发新版
 - `.gitignore` —— `dist/` 行，决定了 exe 不入库
 
-> 已发布过的旧 blob 仍留在 git 历史里，工作区删掉不会缩小 `.git`。要彻底清理需重写历史（`git filter-repo --path dist/ --invert-paths` 后强推），本项目未执行——因为会改写所有 commit hash。
+> 历史里仍有 **2 个早期 exe blob（各约 13.7 MB，合计约 28 MB）**，是纳入 `.gitignore` 之前误提交的。
+> 工作区删文件不会缩小 `.git`；要彻底清理需重写历史（`git filter-repo --path dist/ --invert-paths` 后强推），
+> 本项目未执行——因为会改写所有 commit hash，代价大于收益（28 MB 对仓库可用性没有实际影响）。
 
 ---
 
@@ -258,6 +260,7 @@ exe 与源码运行**共用同一份配置**。
 | `notify_sound` / `notify_flash` | `true` | 提示音 / 任务栏闪烁 |
 | `webhook_url` | `""` | 外部推送地址 |
 | `icon_cache_path` | `""` | 图标缓存目录，空 = 默认 |
+| `icon_cache_enabled` | `true` | 是否启用图标磁盘缓存（关掉后每次启动重新下载） |
 | `log_dir` | `""` | 日志目录，空 = `%APPDATA%\RocoMerchant\logs` |
 | `autostart` | `false` | 开机自启 |
 | `close_to_tray` | `true` | 关闭窗口最小化到托盘 |
@@ -266,7 +269,9 @@ exe 与源码运行**共用同一份配置**。
 | `floating_topmost` | `true` | 悬浮窗置顶 |
 | `floating_geometry` | `""` | 悬浮窗位置（自动记忆） |
 | `floating_show_icons` | `true` | 悬浮窗是否显示物品图标 |
+| `show_closed_message` | `true` | 关闭到托盘时是否提示"程序仍在后台运行" |
 | `window_geometry` | `""` | 主窗口位置尺寸（自动记忆） |
+| `providers` | — | 各渠道的 `base_url` / `api_key`（见上文「数据源」），在设置面板里改，不必手编 JSON |
 
 ---
 
@@ -292,7 +297,7 @@ roco-merchant/
 ├── notifier.py                 # 通知编排：原生优先 / 浮窗兜底 / 声音 / 闪烁 / Webhook
 ├── notifier_native.py          # WinRT Toast、AppUserModelID、rocomesh:// 协议注册
 ├── applog.py                   # 日志与异常钩子
-├── selftest.py                 # 自测（233 项）
+├── selftest.py                 # 自测（273 项）
 │
 ├── scripts/                    # 所有可双击运行的脚本
 │   ├── run.bat                 #   源码启动
@@ -356,7 +361,7 @@ python selftest.py
 :: 在仓库根目录执行（脚本内部会自己回到根）
 scripts\sync.bat                     :: 或 python tools\publish.py
 scripts\sync.bat -m "fix(x): 修好了"  :: 指定提交信息
-scripts\sync.bat --tag v1.5.0        :: 顺便打标签并推送
+scripts\sync.bat --tag vX.Y.Z        :: 顺便打标签并推送（tag 要等于 v{APP_VERSION}）
 python tools\publish.py --dry-run    :: 只看会提交哪些文件
 ```
 

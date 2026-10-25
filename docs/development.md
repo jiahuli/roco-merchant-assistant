@@ -120,37 +120,40 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 
 ### 核心逻辑（项目根目录，按依赖顺序）
 
-| 文件 | 行 | 职责 |
-|---|---|---|
-| `main.py` | 115 | 入口。单实例判定 → `netdirect.install()` → 日志 → 建窗口 → 监听"露面"信号 |
-| `config.py` | 330 | `Config` 数据类 + `DEFAULT_PROVIDERS` + 路径解析 + 图标缓存目录校验 |
-| `models.py` | 120 | `MerchantItem`（含 `rounds` / `is_all_day`）、`MerchantSnapshot`（含 `is_round_lagging`） |
-| `numerals.py` | 80 | 数字 → 中文读法（`3200000` → 三百二十万），无依赖，易测 |
-| `rarity.py` | 109 | 珍惜度五档推断（关键词 → 分类 → 价格三层），官方数据无此字段 |
-| `providers.py` | 660 | 7 个渠道实现（含页面解析）+ 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
-| `freshness.py` | 409 | 货架新鲜度判定（轮次落后 / 只剩全天商品 / 本轮商品消失），纯状态机，不碰 Tk |
-| `netdirect.py` | 589 | 直连网络层：剥代理 / DoH / 按 IP 直连 / CN 段判定 / 出口诊断 / Clash 规则生成 |
-| `cache.py` | 275 | 图标两级缓存（磁盘 `sha1(url).png` + 内存 `PhotoImage`）+ 目录迁移 |
-| `scheduler.py` | 124 | 1 秒节拍，到点触发；`next_run()` 计算下一次 |
-| `notifier.py` | 321 | 通知编排：原生优先 → 浮窗兜底 → 提示音/闪烁/Webhook，去过重 |
-| `notifier_native.py` | 195 | WinRT Toast（PowerShell `-EncodedCommand` 内联，**不能落 .ps1**） |
-| `tray.py` | 473 | 系统托盘（纯 ctypes `Shell_NotifyIcon`，独立线程消息循环） |
-| `monitors.py` | 216 | 多显示器枚举与边界纯函数（`EnumDisplayMonitors`） |
-| `autostart.py` | 101 | 开机自启（`HKCU\...\Run`） |
-| `single_instance.py` | 106 | 命名互斥 + 命名事件唤醒（`rocomesh://` 回跳落点） |
-| `applog.py` | 224 | 日志（1MB×3 滚动）+ 三类异常钩子（`sys` / `threading` / Tk 回调） |
+| 文件 | 职责 |
+|---|---|
+| `main.py` | 入口。单实例判定 → `netdirect.install()` → 日志 → 建窗口 → 监听"露面"信号 |
+| `config.py` | `Config` 数据类 + `DEFAULT_PROVIDERS` + 路径解析 + 图标缓存目录校验 |
+| `models.py` | `MerchantItem`（含 `rounds` / `is_all_day`）、`MerchantSnapshot`（含 `is_round_lagging`） |
+| `numerals.py` | 数字 → 中文读法（`3200000` → 三百二十万），无依赖，易测 |
+| `rarity.py` | 珍惜度五档推断（关键词 → 分类 → 价格三层），官方数据无此字段 |
+| `providers.py` | 7 个渠道实现（含页面解析）+ 通用 JSON 映射 + 轮次过滤 + 降级顺序。**改接口只动这里** |
+| `freshness.py` | 货架新鲜度判定（轮次落后 / 只剩全天商品 / 本轮商品消失），纯状态机，不碰 Tk |
+| `netdirect.py` | 直连网络层：剥代理 / DoH / 按 IP 直连 / CN 段判定 / 出口诊断 / Clash 规则生成 |
+| `cache.py` | 图标两级缓存（磁盘 `sha1(url).png` + 内存 `PhotoImage`）+ 目录迁移 |
+| `scheduler.py` | 1 秒节拍，到点触发；`next_run()` 计算下一次 |
+| `notifier.py` | 通知编排：原生优先 → 浮窗兜底 → 提示音/闪烁/Webhook，去过重 |
+| `notifier_native.py` | WinRT Toast（PowerShell `-EncodedCommand` 内联，**不能落 .ps1**） |
+| `tray.py` | 系统托盘（纯 ctypes `Shell_NotifyIcon`，独立线程消息循环） |
+| `monitors.py` | 多显示器枚举与边界纯函数（`EnumDisplayMonitors`） |
+| `autostart.py` | 开机自启（`HKCU\...\Run`） |
+| `single_instance.py` | 命名互斥 + 命名事件唤醒（`rocomesh://` 回跳落点） |
+| `applog.py` | 日志（1MB×3 滚动）+ 三类异常钩子（`sys` / `threading` / Tk 回调） |
+
+> 表里**不记行数**：行数每次改动都会过期，留着就成假数据（需要时 `wc -l` 即可）。
+> 判断改哪里看「职责」列，而不是看体量。
 
 ### 界面（`ui/`）
 
-| 文件 | 行 | 职责 |
-|---|---|---|
-| `ui/app_window.py` | 1241 | 主窗口：工具栏 / 货架卡片网格 / 状态栏 / 重试与刷新编排 / 托盘命令消费 |
-| `ui/settings_dialog.py` | 723 | 设置面板（定时 / 渠道 / 网络直连 / 通知 / 悬浮窗 / 缓存 / 日志 / 启动） |
-| `ui/floating_window.py` | 392 | 置顶悬浮窗（拖动 / 收起 / 图标开关 / 多屏记忆） |
-| `ui/network_dialog.py` | 198 | 网络与出口诊断面板 |
-| `ui/log_viewer.py` | 185 | 日志查看器 |
-| `ui/widgets.py` | 490 | 自绘控件：`PillButton` / `ScrollFrame` / `StatBlock` / `ItemCard` / `RarityBadge` / `Tooltip` |
-| `ui/theme.py` | 115 | 颜色与字体（深色主题常量） |
+| 文件 | 职责 |
+|---|---|
+| `ui/app_window.py` | 主窗口：工具栏 / 货架卡片网格 / 状态栏 / 重试与刷新编排 / 托盘命令消费 |
+| `ui/settings_dialog.py` | 设置面板（定时 / 渠道 / 网络直连 / 通知 / 悬浮窗 / 缓存 / 日志 / 启动） |
+| `ui/floating_window.py` | 置顶悬浮窗（拖动 / 收起 / 图标开关 / 多屏记忆） |
+| `ui/network_dialog.py` | 网络与出口诊断面板 |
+| `ui/log_viewer.py` | 日志查看器 |
+| `ui/widgets.py` | 自绘控件：`PillButton` / `ScrollFrame` / `StatBlock` / `ItemCard` / `RarityBadge` / `Tooltip` |
+| `ui/theme.py` | 颜色与字体（深色主题常量） |
 
 ### 数据与工具
 
@@ -275,7 +278,7 @@ scheduler 到点 / 用户点刷新
 ```bat
 :: 在仓库根目录执行（scripts\sync.bat 内部会自己回到根）
 scripts\sync.bat                                    :: 自测 -> 提交 -> 推送
-scripts\sync.bat -m "fix(x): 修好了" --tag v1.5.0    :: 指定提交信息，顺便打标签
+scripts\sync.bat -m "fix(x): 修好了" --tag vX.Y.Z    :: 指定提交信息，顺便打标签
 python tools\publish.py --dry-run                   :: 只看会提交哪些文件
 python tools\publish.py --push-only                 :: 只推送已有提交（网络恢复后用）
 ```
@@ -365,12 +368,14 @@ python tools\release.py --asset "dist\远行商人助手.exe" --notes-file docs\
 ## 11. 已知限制 / 可继续做的事
 
 - **透明代理（路由器 TProxy）无法从客户端绕过**：这是协议事实。现有对策是让目标落在中国大陆
-  （`cn_mirror` / `shallow`），或在路由器侧加 DIRECT 规则。README「网络直连」一节有完整论证。
-- CI（`.github/workflows/release.yml`）已写好但**从未在真实 runner 上跑过**，需 `workflow` scope 才能推。
+  （默认渠道 `onebiji` 本身在境内，`cn_mirror` / `shallow` 也在境内），或在路由器侧加 DIRECT 规则。
+  README「网络直连」一节有完整论证。
+- CI 模板在 `docs/ci/release.yml`，**从未在真实 runner 上跑过**；启用需把文件复制到
+  `.github/workflows/`，且推送需要带 `workflow` scope 的 token。
 - 珍惜度是**推断**结果，非官方字段；`rarity.py` 里的关键词表可按实际掉落调整。
 - `goods_list` 目前未使用（与 `items` 同构），如上游将来把"全天商品"只放这里，需要合并两个列表。
 - 界面为固定深色主题，无浅色模式。
-- 仓库仍保留历史 exe blob（v1.2/v1.3），未重写历史。
+- 仓库历史里有 2 个早期 exe blob（各约 13.7 MB），未重写历史；`.git` 约 28 MB，不影响日常使用。
 
 ---
 
