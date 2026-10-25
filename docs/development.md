@@ -363,6 +363,24 @@ python tools\release.py --asset "dist\远行商人助手.exe" --notes-file docs\
 > `tools/publish.py` 的自测门禁会自动挑带 tkinter 的解释器；`scripts/build.bat` 用的是
 > `.buildenv` 里的独立环境，两者互不影响。
 
+### 10.1 发布前自检（6 项全绿才算"稳定"，缺一项就别推）
+
+| # | 检查 | 命令 / 判据 | 不过关说明什么 |
+|---|---|---|---|
+| 1 | 版本三处一致 | `config.APP_VERSION`、`packaging/version_info.txt`、`docs/release-notes.md` 首行必须同一个号；tag 为 `v{APP_VERSION}` | 发出去的 exe 属性、Release 标题、正文会互相矛盾 |
+| 2 | 自测全过 | `python selftest.py` → `失败 0 项` | 有回归；**不要**用 `--skip-tests` 绕过 |
+| 3 | 语法通过 | `python -m compileall -q .` | 有文件没被导入过，隐藏语法/缩进错误 |
+| 4 | 能构建 | `scripts\build.bat` 或 `pyinstaller --noconfirm app.spec`，再核对 exe 的 `FileVersion` | spec 漏了 `datas`、图标或版本资源没打进 |
+| 5 | 工作区干净 | `python tools\publish.py --dry-run` → "没有需要同步的改动" | 有未提交改动，或产物误入版本库 |
+| 6 | 能启动 | 双击 exe（或 `scripts\run.bat`），日志出现 `主窗口就绪` + `查询成功`，无 `ERROR` | 运行时缺依赖、Tk 初始化失败、渠道不可用 |
+
+两项说明：
+
+- **第 1 项是三处手写值**，最容易漏。当前没有脚本强制校验，所以放在清单第一位；
+  真要根治，可在 `tools/publish.py` 的提交门禁里加一条"三处不一致就拒绝提交"。
+- **第 6 项不能用自测替代**：自测跑的是源码，exe 还多一层打包（隐藏导入、`datas`、清单资源）。
+  打包正常但启动即崩的情况，本项目真实发生过（ctypes 未声明 `restype`）。
+
 ---
 
 ## 11. 已知限制 / 可继续做的事
