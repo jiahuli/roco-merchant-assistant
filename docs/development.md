@@ -166,7 +166,7 @@ Windows 桌面工具：定时抓取《洛克王国：世界》远行商人货架
 | `scripts/sync.bat` | `tools/publish.py` 的 Windows 一键入口（自测 → 提交 → 推送） |
 | `packaging/version_info.txt` | exe 文件版本资源，被 `app.spec` 的 `version=` 引用；**发版时要与 `APP_VERSION` 同步** |
 | `app.spec` | PyInstaller 配置。**新增数据文件必须加进 `datas`**（如 `data/cn_ipv4.txt`），否则打包后功能静默失效 |
-| `selftest.py` | 233 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
+| `selftest.py` | 273 项断言，纯标准库 + 真实窗口，**跑完会自动还原 config/state/注册表** |
 | `docs/development.md` | 本文档（开发交接、可配置项、同步流程），原 `DEVELOPMENT.md` |
 | `docs/cn-mirror.md` | 自建大陆反代（Nginx / 云函数两套配置） |
 | `docs/release-notes.md` | 当前版本的发布说明，`tools/release.py` 直接拿它当 Release 正文 |
@@ -327,6 +327,7 @@ python tools\publish.py --push-only                 :: 只推送已有提交（�
 | **threading 里碰 Tk** | 随机崩溃 / 静默失效 | 一律 `queue` + 主线程 `after` |
 | **自测污染真实配置** | 测试改过的开关留在用户 config，看着像 bug | `preserve_app_files()` 备份还原 config/state + 注册表 |
 | **`rounds` 语义** | 条件球"一直在"被当成没刷新 | 它是 `(1,2,3,4)` 全天商品，正常 |
+| **价格里的简写单位** | `价格：16w` 被读成 16，界面显示"十六"、传说物品不再提醒 | `_to_int()` 认识 `万/w/亿/千/k`（`16w` → 160000）；页面价格正则要抓整段，别用 `[0-9]` 截断 |
 
 ---
 
@@ -335,7 +336,7 @@ python tools\publish.py --push-only                 :: 只推送已有提交（�
 ```bat
 :: 运行时（根目录）
 python main.py                              :: 跑源码（需 Python 3.9+ 且含 tkinter）
-python selftest.py                          :: 233 项自测，应输出"失败 0 项"
+python selftest.py                          :: 273 项自测，应输出"失败 0 项"
 python -m compileall -q .                   :: 语法检查
 
 :: 脚本（scripts/ 下，双击或命令行均可）

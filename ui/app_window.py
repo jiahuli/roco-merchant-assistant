@@ -371,6 +371,8 @@ class MerchantApp:
                     on_close=self._on_floating_closed,
                     on_activate=self.show_from_background,
                     loader=self.loader,          # 共用主窗口的图标缓存
+                    # 悬浮窗里的「⟳」：直接复用主窗口的取数链路，不弹前台窗口
+                    on_refresh=lambda: self.refresh(reason="悬浮窗获取"),
                 )
             self.floating.deiconify()
             self.floating.attributes("-topmost", self.config.floating_topmost)
@@ -481,6 +483,17 @@ class MerchantApp:
         self._evaluate_freshness(snapshot, reason)
         self._remember_shelf(snapshot)
         self._maybe_notify(snapshot)
+        self._end_floating_refresh()
+
+    def _end_floating_refresh(self) -> None:
+        """查询结束：复位悬浮窗的「⟳」按钮状态（窗口可能已关闭，安全跳过）。"""
+        floating = self.floating
+        if floating is None:
+            return
+        try:
+            floating.set_refreshing(False)
+        except tk.TclError:
+            self.floating = None
 
     def _cancel_round_retry(self) -> None:
         if self._round_retry_job is not None:
@@ -663,6 +676,7 @@ class MerchantApp:
         if self.snapshot is None:
             self._render_error(message)
         self._update_cache_label()
+        self._end_floating_refresh()
 
     # ------------------------------------------------------------------ 渲染
     def _reset_content(self) -> None:

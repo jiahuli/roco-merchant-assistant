@@ -60,21 +60,41 @@ def _first_value(data: dict[str, Any], keys: Iterable[str]) -> Any:
     return None
 
 
+# 价格里的简写单位：数据源会用 "16w" / "16万" 表示 160000。
+# 只抓数字会把它读成 16，中文读法就成了"十六"（而不是"十六万"）。
+_UNIT_FACTORS: tuple[tuple[str, int], ...] = (
+    ("亿", 100_000_000), ("万", 10_000), ("w", 10_000), ("W", 10_000),
+    ("千", 1_000), ("k", 1_000), ("K", 1_000),
+)
+
+
 def _to_int(value: Any) -> int | None:
+    """把字段值转成整数；支持 `万` / `w` / `亿` / `千` / `k` 等简写单位。
+
+    `16w` → 16000、`16万` → 160000、`1.6w` → 16000；没有单位时按原样取整数。
+    """
     if value is None:
         return None
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return int(value)
-    text = str(value).strip()
-    match = re.search(r"-?\d[\d,]*", text)
+    text = str(value).strip().replace("，", ",")
+    match = re.search(r"-?\d[\d,]*(?:\.\d+)?", text)
     if not match:
         return None
+    raw = match.group(0).replace(",", "")
     try:
-        return int(match.group(0).replace(",", ""))
+        number = float(raw) if "." in raw else int(raw)
     except ValueError:
         return None
+    # 单位只认紧随数字（允许中间有空格）的那一个字符
+    unit = text[match.end():].lstrip()[:1]
+    if unit:
+        for symbol, factor in _UNIT_FACTORS:
+            if unit == symbol:
+                return int(round(float(number) * factor))
+    return int(number)
 
 
 def _dig(payload: Any, path: str) -> Any:
@@ -356,7 +376,9 @@ _ONEBJJI_ROUND = re.compile(r"\bshow_([1-4])\b")
 _ONEBJJI_ARGS = re.compile(r"showShopinfo\((.*?)\)", re.S)
 _ONEBJJI_QUOTED = re.compile(r"'((?:[^'\\]|\\.)*)'")
 _ONEBJJI_NAME = re.compile(r'class="shop_name">\s*([^<]+?)\s*<')
-_ONEBJJI_PRICE = re.compile(r'class="shop_price">\s*价格[:：]\s*([0-9][0-9,]*)')
+# 价格原文可能是 "3000"、"16w"、"16万"：整段交给 _to_int() 处理单位，
+# 不要在这里用 [0-9] 截断，否则 "16w" 会变成 16
+_ONEBJJI_PRICE = re.compile(r'class="shop_price">\s*价格[:：]\s*([^<]+)')
 _ONEBJJI_LIMIT = re.compile(r"<em>\s*限购\s*([0-9]+)\s*</em>")
 _ONEBJJI_IMG = re.compile(r'<div class="gitem"[^>]*>\s*<img[^>]+src="([^"]+)"')
 

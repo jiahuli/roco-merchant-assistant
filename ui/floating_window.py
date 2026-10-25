@@ -31,7 +31,8 @@ class FloatingWindow(tk.Toplevel):
     def __init__(self, master: tk.Misc, config: Config,
                  on_close: Optional[Callable[[], None]] = None,
                  on_activate: Optional[Callable[[], None]] = None,
-                 loader: Optional[ImageLoader] = None) -> None:
+                 loader: Optional[ImageLoader] = None,
+                 on_refresh: Optional[Callable[[], None]] = None) -> None:
         super().__init__(master, bg=BORDER)
         self.config_data = config
         # 与主窗口共用同一个加载器：磁盘缓存与内存缓存都能复用，不会重复请求
@@ -40,6 +41,9 @@ class FloatingWindow(tk.Toplevel):
         self._icon_widgets: list[tk.Widget] = []
         self._on_close = on_close
         self._on_activate = on_activate
+        # 悬浮窗自带的"立即获取"：不打开主窗口也能拉一次数据
+        self._on_refresh = on_refresh
+        self._refreshing = False
         self._topmost = bool(config.floating_topmost)
         self._collapsed = False
         self._rows: list[tk.Widget] = []
@@ -91,6 +95,9 @@ class FloatingWindow(tk.Toplevel):
         self.pin_btn = self._icon_button("◉" if self._topmost else "○",
                                         self.toggle_topmost, "窗口置顶")
         self.pin_btn.pack(side="right", padx=(0, 2))
+        # 放在最左侧（side=right 逆序打包），避免和关闭按钮挨着误点
+        self.refresh_btn = self._icon_button("⟳", self.request_refresh, "立即获取最新物品")
+        self.refresh_btn.pack(side="right", padx=(0, 2))
 
         for widget in (self.header, self.title_label, self.header_info, self.accent_bar):
             widget.bind("<ButtonPress-1>", self._drag_start)
@@ -219,6 +226,42 @@ class FloatingWindow(tk.Toplevel):
         self.pin_btn.configure(text="◉" if self._topmost else "○",
                                fg=ACCENT if self._topmost else MUTED)
         self.config_data.floating_topmost = self._topmost
+
+    # ------------------------------------------------------------ 立即获取
+    def request_refresh(self) -> None:
+        """点「⟳」拉一次最新数据：主窗口藏在托盘里也能用。
+
+        不自己发请求，只把动作交给主窗口（它已线程池 + 结果泵 + 去重），
+        避免悬浮窗另起一套网络逻辑和重复渲染。
+        """
+        if self._refreshing or self._on_refresh is None:
+            return
+        self.set_refreshing(True)
+        try:
+            self._on_refresh()
+        except Exception:
+            self.set_refreshing(False)
+            return
+        # 兜底：查询可能被主窗口的 _loading 挡掉，别让按钮一直转
+        try:
+            self.after(8000, self.set_refreshing, False)
+        except tk.TclError:
+            pass
+
+    def set_refreshing(self, refreshing: bool) -> None:
+        """切换按钮状态；主窗口拿到结果后调用它复位。"""
+        self._refreshing = bool(refreshing)
+        text = "…" if self._refreshing else "⟳"
+        try:
+            if self.refresh_btn.winfo_exists():
+                self.refresh_btn.configure(text=text,
+                                           fg=ACCENT if self._refreshing else MUTED)
+        except tk.TclError:
+            pass
+
+    @property
+    def refreshing(self) -> bool:
+        return self._refreshing
 
     def toggle_collapse(self) -> None:
         self._collapsed = not self._collapsed

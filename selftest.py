@@ -1274,8 +1274,12 @@ def test_provider_onebiji():
     mirror = CnMirrorProvider({"base_url": "https://mirror.example/merchant"})
     mirror._request_text = lambda url, headers=None, use_doh=True: page
     mirrored = mirror.fetch()
-    check("反代页面也能解析", len(mirrored.items) == 2 and mirrored.source_id == "cn_mirror",
-          f"{len(mirrored.items)}/{mirrored.source_id}")
+    # 不断言本轮保留几件：解析结果会按"当前轮次"过滤，跑在不同时间点结论不同。
+    # 用"保留 + 剔除 = 解析总数"来验证解析链路，才不会随钟点飘。
+    check("反代页面也能解析",
+          mirrored.source_id == "cn_mirror"
+          and len(mirrored.items) + mirrored.dropped_count == 2,
+          f"{len(mirrored.items)}+{mirrored.dropped_count}/{mirrored.source_id}")
 
     # 老配置：provider=rkw + 残留 rkw 条目 → 迁移到 onebiji 并清理
     import json
@@ -1291,6 +1295,147 @@ def test_provider_onebiji():
         check("老 provider=rkw 迁移到 onebiji", loaded.provider == "onebiji", loaded.provider)
         check("老 rkw 条目被清理", "rkw" not in loaded.providers,
               str(list(loaded.providers)))
+
+
+def test_price_units():
+    """价格简写单位（16w / 16万）不能被截断成 16 —— 2026-10-25 的回归用例。"""
+    from numerals import to_chinese_number
+    from providers import _to_int, parse_onebiji_html
+
+    cases = {
+        "16w": 160000, "16W": 160000, "16万": 160000, "1.6w": 16000,
+        "160,000": 160000, "3000": 3000, "价格：16w": 160000,
+        "1000 万": 10_000_000, "16亿": 1_600_000_000,
+    }
+    bad = {key: _to_int(key) for key, want in cases.items() if _to_int(key) != want}
+    check("价格单位换算", not bad, str(bad))
+    check("纯数字与限购不受影响",
+          _to_int("3200000") == 3200000 and _to_int("限购100") == 100,
+          f"{_to_int('3200000')}/{_to_int('限购100')}")
+    check("中文读法本身正确", to_chinese_number(160000) == "十六万",
+          to_chinese_number(160000))
+
+    page = '''
+    <li class="all_show li_show on show_2 " onclick="showShopinfo('','国王球','条件球','')">
+      <div class="gitem"><img src="https://img/k.png"><em>限购10</em></div>
+      <div class="sp-text"><p><em class="shop_name">国王球</em></p>
+        <div><em class="shop_price">价格：16w </em></div></div>
+    </li>
+    '''
+    item = parse_onebiji_html(page)[0]
+    check("页面 16w 解析为 160000", item.price == 160000, str(item.price))
+    check("页面价格中文读法", item.price_text == "十六万", item.price_text)
+    check("原样价格不被截断", item.price_raw_text == "160,000 洛克贝",
+          item.price_raw_text)
+    check("稀有度按真实价格推断", item.rarity.level >= 4, item.rarity.label)
+
+
+def test_floating_refresh_button():
+    """悬浮窗的「⟳」：不打开主窗口也能取数，状态能复位。"""
+    from ui.floating_window import FloatingWindow
+
+    root = tk.Tk()
+    root.withdraw()
+    hits: list[int] = []
+    floating = FloatingWindow(root, Config(), on_refresh=lambda: hits.append(1))
+    try:
+        root.update()
+        check("悬浮窗有获取按钮", floating.refresh_btn.cget("text") == "⟳",
+              floating.refresh_btn.cget("text"))
+        floating.request_refresh()
+        check("点击触发取数", hits == [1], str(hits))
+        check("取数中按钮变状态", floating.refresh_btn.cget("text") == "…",
+              floating.refresh_btn.cget("text"))
+        check("取数中标记为真", floating.refreshing is True)
+        floating.request_refresh()
+        check("取数中不重复触发", hits == [1], str(hits))
+        floating.set_refreshing(False)
+        check("结果回来按钮复位", floating.refresh_btn.cget("text") == "⟳",
+              floating.refresh_btn.cget("text"))
+
+        floating.toggle_collapse()
+        root.update()
+        check("收起后按钮仍可见", bool(floating.refresh_btn.winfo_ismapped()),
+              str(floating.refresh_btn.winfo_ismapped()))
+        floating.request_refresh()
+        check("收起后仍可取数", len(hits) == 2, str(hits))
+    finally:
+        floating.destroy()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
+def test_floating_refresh_while_hidden():
+    """端到端：主窗口藏在托盘里，点悬浮窗按钮也能拿到并展示最新物品。"""
+    import ui.app_window as aw
+
+    state = {"calls": 0}
+
+    def fake_fetch(_config):
+        state["calls"] += 1
+        return MerchantSnapshot(
+            items=[MerchantItem("国王球", 160000, 10, rounds=(2,), icon_url="")],
+            status="open", round_index=2, expected_round=2,
+            source_label="测试渠道", fetched_at=datetime.now(),
+        ), []
+
+    original_fetch = aw.fetch_snapshot
+    aw.fetch_snapshot = fake_fetch
+    root = tk.Tk()
+    root.withdraw()
+    config = Config()
+    config.notify_enabled = False
+    config.verify_egress = False
+    app = aw.MerchantApp(root, config)
+    try:
+        def pump_until(condition, timeout=20):
+            end = time.time() + timeout
+            while time.time() < end:
+                root.update()
+                time.sleep(0.01)
+                if condition():
+                    return True
+            return False
+
+        ok = pump_until(lambda: state["calls"] >= 1 and not app._loading)
+        check("首次取数完成", ok, f"calls={state['calls']}")
+
+        app.toggle_floating(True, quiet=True)
+        root.update()
+        app.hide_to_tray(save_geometry=False)
+        root.update()
+        check("主窗口已隐藏", not app.root.winfo_viewable())
+
+        before = state["calls"]
+        app.floating.request_refresh()
+        # 等到"取数完成 + 按钮复位"：calls 在后台线程先加，回调还没跑完时不能断言
+        fetched = pump_until(lambda: state["calls"] > before and not app._loading
+                             and not app.floating.refreshing)
+        check("隐藏时点按钮能取数", fetched, f"{before} -> {state['calls']}")
+        check("没有把主窗口叫到前台", not app.root.winfo_viewable())
+        check("悬浮窗按钮已复位", not app.floating.refreshing)
+
+        def collect(widget) -> list[str]:
+            texts = []
+            for child in widget.winfo_children():
+                try:
+                    texts.append(str(child.cget("text")))
+                except tk.TclError:
+                    pass
+                texts.extend(collect(child))
+            return texts
+
+        check("悬浮窗展示最新中文价格",
+              any("十六万" in text for text in collect(app.floating)),
+              str([t for t in collect(app.floating) if t][:8]))
+    finally:
+        aw.fetch_snapshot = original_fetch
+        try:
+            app.quit_app()
+        except Exception:
+            pass
 
 
 def test_netdirect_proxy_strip():
@@ -1611,7 +1756,9 @@ def _run_all():
                test_floating_multimonitor, test_logging, test_tk_error_hook,
                test_rounds_parsing, test_round_lag_detection, test_round_retry_flow,
                test_shelf_freshness_rules, test_all_day_recheck_flow,
-               test_provider_onebiji, test_give_up_policy, test_publish_script,
+               test_provider_onebiji, test_price_units,
+               test_floating_refresh_button, test_floating_refresh_while_hidden,
+               test_give_up_policy, test_publish_script,
                test_settings_recheck_fields,
                test_netdirect_proxy_strip, test_netdirect_addr, test_netdirect_doh,
                test_clash_rules, test_cn_mirror_provider, test_route_on_snapshot,
