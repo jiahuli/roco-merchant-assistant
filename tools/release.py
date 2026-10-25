@@ -35,7 +35,7 @@ DEFAULT_EXE = ROOT / "dist" / "远行商人助手.exe"
 
 def version() -> str:
     sys.path.insert(0, str(ROOT))
-    from config import APP_VERSION
+    from roco.config import APP_VERSION
 
     return APP_VERSION
 
